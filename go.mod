@@ -13,7 +13,7 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/hashicorp/golang-lru v0.5.4
 	github.com/hashicorp/hcl v1.0.0
-	github.com/hashicorp/vault/api v1.3.1
+	github.com/hashicorp/vault/api v1.4.1
 	github.com/imdario/mergo v0.3.12
 	github.com/libp2p/go-libp2p v0.18.0-rc2
 	github.com/libp2p/go-libp2p-core v0.14.0
@@ -38,6 +38,7 @@ require (
 )
 
 require (
+	github.com/aws/aws-sdk-go v1.40.45
 	github.com/benbjohnson/clock v1.3.0 // indirect
 	github.com/containerd/cgroups v1.0.2 // indirect
 	github.com/elastic/gosigar v0.14.2 // indirect
