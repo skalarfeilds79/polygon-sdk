@@ -1,7 +1,6 @@
 package dev
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -12,6 +11,10 @@ import (
 	"github.com/0xPolygon/polygon-edge/txpool"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
+)
+
+const (
+	devConsensus = "dev-consensus"
 )
 
 // Dev consensus protocol seals any new transaction immediately
@@ -30,7 +33,7 @@ type Dev struct {
 
 // Factory implements the base factory method
 func Factory(
-	params *consensus.ConsensusParams,
+	params *consensus.Params,
 ) (consensus.Consensus, error) {
 	logger := params.Logger.Named("dev")
 
@@ -40,7 +43,7 @@ func Factory(
 		closeCh:    make(chan struct{}),
 		blockchain: params.Blockchain,
 		executor:   params.Executor,
-		txpool:     params.Txpool,
+		txpool:     params.TxPool,
 	}
 
 	rawInterval, ok := params.Config.Config["interval"]
@@ -192,8 +195,12 @@ func (d *Dev) writeNewBlock(parent *types.Header) error {
 		Receipts: transition.Receipts(),
 	})
 
+	if err := d.blockchain.VerifyFinalizedBlock(block); err != nil {
+		return err
+	}
+
 	// Write the block to the blockchain
-	if err := d.blockchain.WriteBlock(block); err != nil {
+	if err := d.blockchain.WriteBlock(block, devConsensus); err != nil {
 		return err
 	}
 
@@ -206,8 +213,12 @@ func (d *Dev) writeNewBlock(parent *types.Header) error {
 
 // REQUIRED BASE INTERFACE METHODS //
 
-func (d *Dev) VerifyHeader(parent *types.Header, header *types.Header) error {
+func (d *Dev) VerifyHeader(header *types.Header) error {
 	// All blocks are valid
+	return nil
+}
+
+func (d *Dev) ProcessHeaders(headers []*types.Header) error {
 	return nil
 }
 
@@ -222,16 +233,6 @@ func (d *Dev) PreStateCommit(_header *types.Header, _txn *state.Transition) erro
 
 func (d *Dev) GetSyncProgression() *progress.Progression {
 	return nil
-}
-
-func (d *Dev) Prepare(header *types.Header) error {
-	// TODO: Remove
-	return nil
-}
-
-func (d *Dev) Seal(block *types.Block, ctx context.Context) (*types.Block, error) {
-	// TODO: Remove
-	return nil, nil
 }
 
 func (d *Dev) Close() error {

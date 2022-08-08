@@ -2,6 +2,7 @@ package loadbot
 
 import (
 	"fmt"
+
 	"github.com/0xPolygon/polygon-edge/command"
 	"github.com/0xPolygon/polygon-edge/command/helper"
 	"github.com/spf13/cobra"
@@ -19,7 +20,7 @@ func GetCommand() *cobra.Command {
 	helper.RegisterJSONRPCFlag(loadbotCmd)
 
 	setFlags(loadbotCmd)
-	setRequiredFlags(loadbotCmd)
+	helper.SetRequiredFlags(loadbotCmd, params.getRequiredFlags())
 
 	return loadbotCmd
 }
@@ -29,28 +30,28 @@ func setFlags(cmd *cobra.Command) {
 		&params.tps,
 		tpsFlag,
 		100,
-		"number of transactions to send per second. Default: 100",
+		"number of transactions to send per second.",
 	)
 
 	cmd.Flags().Uint64Var(
 		&params.chainID,
 		chainIDFlag,
 		100,
-		"the network chain ID. Default: 100",
+		"the network chain ID.",
 	)
 
 	cmd.Flags().Uint64Var(
 		&params.count,
 		countFlag,
 		1000,
-		"the number of transactions to sent in total. Default: 1000",
+		"the number of transactions to sent in total.",
 	)
 
 	cmd.Flags().StringVar(
 		&params.modeRaw,
 		modeFlag,
 		string(transfer),
-		"the mode of operation [transfer, deploy]. Default: transfer",
+		"the mode of operation [transfer, deploy, erc20, erc721].",
 	)
 
 	cmd.Flags().StringVar(
@@ -71,8 +72,10 @@ func setFlags(cmd *cobra.Command) {
 		&params.valueRaw,
 		valueFlag,
 		"0x100",
-		"the value sent in each transaction in wei. Default: 100",
+		"the value sent in each transaction in wei.",
 	)
+	// override default value for help output
+	cmd.Flag(valueFlag).DefValue = "100"
 
 	cmd.Flags().StringVar(
 		&params.gasPriceRaw,
@@ -102,26 +105,32 @@ func setFlags(cmd *cobra.Command) {
 		&params.detailed,
 		detailedFlag,
 		false,
-		"flag indicating if the error logs should be shown. Default: false",
+		"flag indicating if the error logs should be shown",
 	)
 
 	cmd.Flags().Uint64Var(
 		&params.maxConns,
 		maxConnsFlag,
-		2*params.tps,
-		"sets the maximum no.of connections allowed per host. Default: 2*tps",
+		1000000,
+		"sets the maximum no. of connections allowed per host.",
 	)
-}
 
-func setRequiredFlags(cmd *cobra.Command) {
-	for _, requiredFlag := range params.getRequiredFlags() {
-		_ = cmd.MarkFlagRequired(requiredFlag)
-	}
+	cmd.Flags().Uint64Var(
+		&params.maxWait,
+		maxWaitFlag,
+		0,
+		"sets the maximum wait time for transactions receipts in minutes.",
+	)
 }
 
 func runPreRun(cmd *cobra.Command, _ []string) error {
 	if err := params.validateFlags(); err != nil {
 		return err
+	}
+
+	// initialize raw parameters
+	if err := params.initRawParams(); err != nil {
+		return errInvalidValues
 	}
 
 	if _, err := helper.ParseGRPCAddress(
@@ -170,6 +179,7 @@ func runLoadbot(config *Configuration, detailed bool) (*LoadbotResult, error) {
 
 	result := newLoadbotResult(
 		loadbot.GetMetrics(),
+		config.GeneratorMode,
 	)
 
 	if detailed {

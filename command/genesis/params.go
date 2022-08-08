@@ -3,6 +3,7 @@ package genesis
 import (
 	"errors"
 	"fmt"
+
 	"github.com/0xPolygon/polygon-edge/chain"
 	"github.com/0xPolygon/polygon-edge/command"
 	"github.com/0xPolygon/polygon-edge/command/helper"
@@ -23,6 +24,8 @@ const (
 	epochSizeFlag           = "epoch-size"
 	blockGasLimitFlag       = "block-gas-limit"
 	posFlag                 = "pos"
+	minValidatorCount       = "min-validator-count"
+	maxValidatorCount       = "max-validator-count"
 )
 
 // Legacy flags that need to be preserved for running clients
@@ -35,11 +38,10 @@ var (
 )
 
 var (
-	errValidatorsNotSpecified         = errors.New("validator information not specified")
-	errValidatorsSpecifiedIncorrectly = errors.New("validator information specified through mutually exclusive flags")
-	errUnsupportedConsensus           = errors.New("specified consensusRaw not supported")
-	errMissingBootnode                = errors.New("at least 1 bootnode is required")
-	errInvalidEpochSize               = errors.New("epoch size must be greater than 1")
+	errValidatorsNotSpecified    = errors.New("validator information not specified")
+	errValidatorNumberExceedsMax = errors.New("validator number exceeds max validator number")
+	errUnsupportedConsensus      = errors.New("specified consensusRaw not supported")
+	errInvalidEpochSize          = errors.New("epoch size must be greater than 1")
 )
 
 type genesisParams struct {
@@ -58,6 +60,9 @@ type genesisParams struct {
 	blockGasLimit uint64
 	isPos         bool
 
+	minNumValidators uint64
+	maxNumValidators uint64
+
 	extraData []byte
 	consensus server.ConsensusType
 
@@ -67,11 +72,6 @@ type genesisParams struct {
 }
 
 func (p *genesisParams) validateFlags() error {
-	// Check if the correct number of bootnodes is provided
-	if len(p.bootnodes) < 1 {
-		return errMissingBootnode
-	}
-
 	// Check if the consensusRaw is supported
 	if !server.ConsensusSupported(p.consensusRaw) {
 		return errUnsupportedConsensus
@@ -82,13 +82,6 @@ func (p *genesisParams) validateFlags() error {
 		!p.areValidatorsSetManually() &&
 		!p.areValidatorsSetByPrefix() {
 		return errValidatorsNotSpecified
-	}
-
-	// Check if mutually exclusive flags are set correctly
-	if p.isIBFTConsensus() &&
-		p.areValidatorsSetManually() &&
-		p.areValidatorsSetByPrefix() {
-		return errValidatorsSpecifiedIncorrectly
 	}
 
 	// Check if the genesis file already exists
@@ -102,6 +95,11 @@ func (p *genesisParams) validateFlags() error {
 		// Otherwise, every block would be an endblock (meaning it will not have any transactions).
 		// Check is placed here to avoid additional parsing if epochSize < 2
 		return errInvalidEpochSize
+	}
+
+	// Validate min and max validators number
+	if err := command.ValidateMinMaxValidatorsNumber(p.minNumValidators, p.maxNumValidators); err != nil {
+		return err
 	}
 
 	return nil
@@ -138,7 +136,8 @@ func (p *genesisParams) initRawParams() error {
 	return nil
 }
 
-func (p *genesisParams) initValidatorSet() error {
+// setValidatorSetFromCli sets validator set from cli command
+func (p *genesisParams) setValidatorSetFromCli() {
 	if len(p.ibftValidatorsRaw) != 0 {
 		for _, val := range p.ibftValidatorsRaw {
 			p.ibftValidators = append(
@@ -146,11 +145,17 @@ func (p *genesisParams) initValidatorSet() error {
 				types.StringToAddress(val),
 			)
 		}
+	}
+}
 
+// setValidatorSetFromPrefixPath sets validator set from prefix path
+func (p *genesisParams) setValidatorSetFromPrefixPath() error {
+	var readErr error
+
+	if !p.areValidatorsSetByPrefix() {
 		return nil
 	}
 
-	var readErr error
 	if p.ibftValidators, readErr = getValidatorsFromPrefixPath(
 		p.validatorPrefixPath,
 	); readErr != nil {
@@ -160,6 +165,27 @@ func (p *genesisParams) initValidatorSet() error {
 	return nil
 }
 
+func (p *genesisParams) initValidatorSet() error {
+	// Set validator set
+	// Priority goes to cli command over prefix path
+	if err := p.setValidatorSetFromPrefixPath(); err != nil {
+		return err
+	}
+
+	p.setValidatorSetFromCli()
+
+	// Validate if validator number exceeds max number
+	if ok := p.isValidatorNumberValid(); !ok {
+		return errValidatorNumberExceedsMax
+	}
+
+	return nil
+}
+
+func (p *genesisParams) isValidatorNumberValid() bool {
+	return uint64(len(p.ibftValidators)) <= p.maxNumValidators
+}
+
 func (p *genesisParams) initIBFTExtraData() {
 	if p.consensus != server.IBFTConsensus {
 		return
@@ -167,7 +193,7 @@ func (p *genesisParams) initIBFTExtraData() {
 
 	ibftExtra := &ibft.IstanbulExtra{
 		Validators:    p.ibftValidators,
-		Seal:          []byte{},
+		ProposerSeal:  []byte{},
 		CommittedSeal: [][]byte{},
 	}
 
@@ -262,7 +288,11 @@ func (p *genesisParams) shouldPredeployStakingSC() bool {
 }
 
 func (p *genesisParams) predeployStakingSC() (*chain.GenesisAccount, error) {
-	stakingAccount, predeployErr := stakingHelper.PredeployStakingSC(p.ibftValidators)
+	stakingAccount, predeployErr := stakingHelper.PredeployStakingSC(p.ibftValidators,
+		stakingHelper.PredeployParams{
+			MinValidatorCount: p.minNumValidators,
+			MaxValidatorCount: p.maxNumValidators,
+		})
 	if predeployErr != nil {
 		return nil, predeployErr
 	}

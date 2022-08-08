@@ -1,4 +1,3 @@
-//nolint:forcetypeassert
 package state
 
 import (
@@ -67,8 +66,6 @@ func (txn *Txn) Snapshot() int {
 
 	id := len(txn.snapshots)
 	txn.snapshots = append(txn.snapshots, t)
-
-	// fmt.Printf("take snapshot ========> %d\n", id)
 
 	return id
 }
@@ -194,7 +191,6 @@ func (txn *Txn) SubBalance(addr types.Address, amount *big.Int) error {
 
 // SetBalance sets the balance
 func (txn *Txn) SetBalance(addr types.Address, balance *big.Int) {
-	//fmt.Printf("SET BALANCE: %s %s\n", addr.String(), balance.String())
 	txn.upsertAccount(addr, true, func(object *StateObject) {
 		object.Account.Balance.SetBytes(balance.Bytes())
 	})
@@ -355,7 +351,7 @@ func (txn *Txn) GetState(addr types.Address, key types.Hash) types.Hash {
 			if val == nil {
 				return types.Hash{}
 			}
-
+			//nolint:forcetypeassert
 			return types.BytesToHash(val.([]byte))
 		}
 	}
@@ -416,6 +412,7 @@ func (txn *Txn) GetCode(addr types.Address) []byte {
 	v, ok := txn.codeCache.Get(addr)
 
 	if ok {
+		//nolint:forcetypeassert
 		return v.([]byte)
 	}
 
@@ -482,7 +479,7 @@ func (txn *Txn) Logs() []*types.Log {
 	}
 
 	txn.txn.Delete(logIndex)
-
+	//nolint:forcetypeassert
 	return data.([]*types.Log)
 }
 
@@ -492,6 +489,7 @@ func (txn *Txn) GetRefund() uint64 {
 		return 0
 	}
 
+	//nolint:forcetypeassert
 	return data.(uint64)
 }
 

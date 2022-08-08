@@ -3,7 +3,6 @@ package ibft
 import (
 	"errors"
 	"fmt"
-
 	"github.com/0xPolygon/polygon-edge/contracts/staking"
 	stakingHelper "github.com/0xPolygon/polygon-edge/helper/staking"
 	"github.com/0xPolygon/polygon-edge/state"
@@ -15,11 +14,13 @@ type PoSMechanism struct {
 	BaseConsensusMechanism
 	// Params
 	ContractDeployment uint64 // The height when deploying staking contract
+	MaxValidatorCount  uint64
+	MinValidatorCount  uint64
 }
 
 // PoSFactory initializes the required data
 // for the Proof of Stake mechanism
-func PoSFactory(ibft *Ibft, params *IBFTFork) (ConsensusMechanism, error) {
+func PoSFactory(ibft *backendIBFT, params *IBFTFork) (ConsensusMechanism, error) {
 	pos := &PoSMechanism{
 		BaseConsensusMechanism: BaseConsensusMechanism{
 			mechanismType: PoS,
@@ -39,7 +40,7 @@ func PoSFactory(ibft *Ibft, params *IBFTFork) (ConsensusMechanism, error) {
 // IsAvailable returns indicates if mechanism should be called at given height
 func (pos *PoSMechanism) IsAvailable(hookType HookType, height uint64) bool {
 	switch hookType {
-	case AcceptStateLogHook, VerifyBlockHook, CalculateProposerHook:
+	case VerifyBlockHook:
 		return pos.IsInRange(height)
 	case PreStateCommitHook:
 		// deploy contract on ContractDeployment
@@ -72,37 +73,19 @@ func (pos *PoSMechanism) initializeParams(params *IBFTFork) error {
 		}
 
 		pos.ContractDeployment = params.Deployment.Value
+
+		if params.MaxValidatorCount == nil {
+			pos.MaxValidatorCount = stakingHelper.MaxValidatorCount
+		} else {
+			pos.MaxValidatorCount = params.MaxValidatorCount.Value
+		}
+
+		if params.MinValidatorCount == nil {
+			pos.MinValidatorCount = stakingHelper.MinValidatorCount
+		} else {
+			pos.MinValidatorCount = params.MinValidatorCount.Value
+		}
 	}
-
-	return nil
-}
-
-// calculateProposerHook calculates the next proposer based on the last
-func (pos *PoSMechanism) calculateProposerHook(lastProposerParam interface{}) error {
-	lastProposer, ok := lastProposerParam.(types.Address)
-	if !ok {
-		return ErrInvalidHookParam
-	}
-
-	pos.ibft.state.CalcProposer(lastProposer)
-
-	return nil
-}
-
-// acceptStateLogHook logs the current snapshot
-func (pos *PoSMechanism) acceptStateLogHook(snapParam interface{}) error {
-	// Cast the param to a *Snapshot
-	snap, ok := snapParam.(*Snapshot)
-	if !ok {
-		return ErrInvalidHookParam
-	}
-
-	// Log the info message
-	pos.ibft.logger.Info(
-		"current snapshot",
-		"validators",
-		len(snap.Set),
-	)
 
 	return nil
 }
@@ -146,7 +129,10 @@ func (pos *PoSMechanism) preStateCommitHook(rawParams interface{}) error {
 	}
 
 	// Deploy Staking contract
-	contractState, err := stakingHelper.PredeployStakingSC(nil)
+	contractState, err := stakingHelper.PredeployStakingSC(nil, stakingHelper.PredeployParams{
+		MinValidatorCount: pos.MinValidatorCount,
+		MaxValidatorCount: pos.MaxValidatorCount,
+	})
 	if err != nil {
 		return err
 	}
@@ -164,9 +150,6 @@ func (pos *PoSMechanism) initializeHookMap() {
 	// Create the hook map
 	pos.hookMap = make(map[HookType]func(interface{}) error)
 
-	// Register the AcceptStateLogHook
-	pos.hookMap[AcceptStateLogHook] = pos.acceptStateLogHook
-
 	// Register the InsertBlockHook
 	pos.hookMap[InsertBlockHook] = pos.insertBlockHook
 
@@ -175,9 +158,6 @@ func (pos *PoSMechanism) initializeHookMap() {
 
 	// Register the PreStateCommitHook
 	pos.hookMap[PreStateCommitHook] = pos.preStateCommitHook
-
-	// Register the CalculateProposerHook
-	pos.hookMap[CalculateProposerHook] = pos.calculateProposerHook
 }
 
 // ShouldWriteTransactions indicates if transactions should be written to a block
@@ -209,9 +189,9 @@ func (pos *PoSMechanism) updateValidators(num uint64) error {
 		return err
 	}
 
-	snap, err := pos.ibft.getSnapshot(header.Number)
-	if err != nil {
-		return err
+	snap := pos.ibft.getSnapshot(header.Number)
+	if snap == nil {
+		return errSnapshotNotFound
 	}
 
 	if snap == nil {
