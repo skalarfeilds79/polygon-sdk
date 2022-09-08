@@ -20,7 +20,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v3
         with:
-          version: latest
+          version: v1.49.0
           args:
             --timeout=3m
             -E whitespace
@@ -38,7 +38,6 @@ jobs:
             -E makezero
             -E lll
             -E importas
-            -E ifshort
             -E gosec
             -E gofmt
             -E goconst

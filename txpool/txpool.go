@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/golang/protobuf/ptypes/any"
 	"github.com/hashicorp/go-hclog"
@@ -20,28 +21,33 @@ import (
 
 const (
 	txSlotSize  = 32 * 1024  // 32kB
-	txMaxSize   = 128 * 1024 //128Kb
+	txMaxSize   = 128 * 1024 // 128Kb
 	topicNameV1 = "txpool/0.1"
 
-	//	maximum allowed number of times an account
-	//	was excluded from block building (ibft.writeTransactions)
+	// maximum allowed number of times an account
+	// was excluded from block building (ibft.writeTransactions)
 	maxAccountDemotions = uint(10)
+
+	pruningCooldown = 5000 * time.Millisecond
 )
 
 // errors
 var (
-	ErrIntrinsicGas        = errors.New("intrinsic gas too low")
-	ErrBlockLimitExceeded  = errors.New("exceeds block gas limit")
-	ErrNegativeValue       = errors.New("negative value")
-	ErrExtractSignature    = errors.New("cannot extract signature")
-	ErrInvalidSender       = errors.New("invalid sender")
-	ErrTxPoolOverflow      = errors.New("txpool is full")
-	ErrUnderpriced         = errors.New("transaction underpriced")
-	ErrNonceTooLow         = errors.New("nonce too low")
-	ErrInsufficientFunds   = errors.New("insufficient funds for gas * price + value")
-	ErrInvalidAccountState = errors.New("invalid account state")
-	ErrAlreadyKnown        = errors.New("already known")
-	ErrOversizedData       = errors.New("oversized data")
+	ErrIntrinsicGas            = errors.New("intrinsic gas too low")
+	ErrBlockLimitExceeded      = errors.New("exceeds block gas limit")
+	ErrNegativeValue           = errors.New("negative value")
+	ErrExtractSignature        = errors.New("cannot extract signature")
+	ErrInvalidSender           = errors.New("invalid sender")
+	ErrTxPoolOverflow          = errors.New("txpool is full")
+	ErrUnderpriced             = errors.New("transaction underpriced")
+	ErrNonceTooLow             = errors.New("nonce too low")
+	ErrInsufficientFunds       = errors.New("insufficient funds for gas * price + value")
+	ErrInvalidAccountState     = errors.New("invalid account state")
+	ErrAlreadyKnown            = errors.New("already known")
+	ErrOversizedData           = errors.New("oversized data")
+	ErrMaxEnqueuedLimitReached = errors.New("maximum number of enqueued transactions reached")
+	ErrRejectFutureTx          = errors.New("rejected future tx due to low slots")
+	ErrSmartContractRestricted = errors.New("smart contract deployment restricted")
 )
 
 // indicates origin of a transaction
@@ -79,9 +85,11 @@ type signer interface {
 }
 
 type Config struct {
-	PriceLimit uint64
-	MaxSlots   uint64
-	Sealing    bool
+	PriceLimit          uint64
+	MaxSlots            uint64
+	MaxAccountEnqueued  uint64
+	Sealing             bool
+	DeploymentWhitelist []types.Address
 }
 
 /* All requests are passed to the main loop
@@ -99,13 +107,13 @@ type enqueueRequest struct {
 // is eligible for promotion. This request is signaled
 // on 2 occasions:
 //
-// 	1. When an enqueued transaction's nonce is
-// 	not greater than the expected (account's nextNonce).
-// 		== 	nextNonce	- transaction is expected (addTx)
-// 		<	nextNonce	- transaction was demoted (Demote)
+// 1. When an enqueued transaction's nonce is
+// not greater than the expected (account's nextNonce).
+// == nextNonce - transaction is expected (addTx)
+// < nextNonce - transaction was demoted (Demote)
 //
-// 	2. When an account's nextNonce is updated (during ResetWithHeader)
-// 	and the first enqueued transaction matches the new nonce.
+// 2. When an account's nextNonce is updated (during ResetWithHeader)
+// and the first enqueued transaction matches the new nonce.
 type promoteRequest struct {
 	account types.Address
 }
@@ -113,9 +121,9 @@ type promoteRequest struct {
 // TxPool is a module that handles pending transactions.
 // All transactions are handled within their respective accounts.
 // An account contains 2 queues a transaction needs to go through:
-// - 1. Enqueued	(entry point)
-// - 2. Promoted	(exit point)
-// 	(both queues are min nonce ordered)
+// - 1. Enqueued (entry point)
+// - 2. Promoted (exit point)
+// (both queues are min nonce ordered)
 //
 // When consensus needs to process promoted transactions,
 // the pool generates a queue of "executable" transactions. These
@@ -150,6 +158,7 @@ type TxPool struct {
 	// does dispatching/handling requests.
 	enqueueReqCh chan enqueueRequest
 	promoteReqCh chan promoteRequest
+	pruneCh      chan struct{}
 
 	// shutdown channel
 	shutdownCh chan struct{}
@@ -164,8 +173,46 @@ type TxPool struct {
 	// Event manager for txpool events
 	eventManager *eventManager
 
+	// deploymentWhitelist map
+	deploymentWhitelist deploymentWhitelist
+
 	// indicates which txpool operator commands should be implemented
 	proto.UnimplementedTxnPoolOperatorServer
+}
+
+// deploymentWhitelist map which contains all addresses which can deploy contracts
+// if empty anyone can
+type deploymentWhitelist struct {
+	// Contract deployment whitelist
+	addresses map[string]bool
+}
+
+// add an address to deploymentWhitelist map
+func (w *deploymentWhitelist) add(addr types.Address) {
+	w.addresses[addr.String()] = true
+}
+
+// allowed checks if address can deploy smart contract
+func (w *deploymentWhitelist) allowed(addr types.Address) bool {
+	if len(w.addresses) == 0 {
+		return true
+	}
+
+	_, ok := w.addresses[addr.String()]
+
+	return ok
+}
+
+func newDeploymentWhitelist(deploymentWhitelistRaw []types.Address) deploymentWhitelist {
+	deploymentWhitelist := deploymentWhitelist{
+		addresses: map[string]bool{},
+	}
+
+	for _, addr := range deploymentWhitelistRaw {
+		deploymentWhitelist.add(addr)
+	}
+
+	return deploymentWhitelist
 }
 
 // NewTxPool returns a new pool for processing incoming transactions.
@@ -183,12 +230,18 @@ func NewTxPool(
 		forks:       forks,
 		store:       store,
 		metrics:     metrics,
-		accounts:    accountsMap{},
 		executables: newPricedQueue(),
+		accounts:    accountsMap{maxEnqueuedLimit: config.MaxAccountEnqueued},
 		index:       lookupMap{all: make(map[types.Hash]*types.Transaction)},
 		gauge:       slotGauge{height: 0, max: config.MaxSlots},
 		priceLimit:  config.PriceLimit,
 		sealing:     config.Sealing,
+
+		//	main loop channels
+		enqueueReqCh: make(chan enqueueRequest),
+		promoteReqCh: make(chan promoteRequest),
+		pruneCh:      make(chan struct{}),
+		shutdownCh:   make(chan struct{}),
 	}
 
 	// Attach the event manager
@@ -208,14 +261,12 @@ func NewTxPool(
 		pool.topic = topic
 	}
 
+	// initialize deployment whitelist
+	pool.deploymentWhitelist = newDeploymentWhitelist(config.DeploymentWhitelist)
+
 	if grpcServer != nil {
 		proto.RegisterTxnPoolOperatorServer(grpcServer, pool)
 	}
-
-	// initialise channels
-	pool.enqueueReqCh = make(chan enqueueRequest)
-	pool.promoteReqCh = make(chan promoteRequest)
-	pool.shutdownCh = make(chan struct{})
 
 	return pool, nil
 }
@@ -227,6 +278,23 @@ func (p *TxPool) Start() {
 	// set default value of txpool pending transactions gauge
 	p.metrics.PendingTxs.Set(0)
 
+	//	run the handler for high gauge level pruning
+	go func() {
+		for {
+			select {
+			case <-p.shutdownCh:
+				return
+			case <-p.pruneCh:
+				p.pruneAccountsWithNonceHoles()
+			}
+
+			//	handler is in cooldown to avoid successive calls
+			//	which could be just no-ops
+			time.Sleep(pruningCooldown)
+		}
+	}()
+
+	//	run the handler for the tx pipeline
 	go func() {
 		for {
 			select {
@@ -322,7 +390,7 @@ func (p *TxPool) Pop(tx *types.Transaction) {
 	// pop the top most promoted tx
 	account.promoted.pop()
 
-	//	successfully popping an account resets its demotions count to 0
+	// successfully popping an account resets its demotions count to 0
 	account.demotions = 0
 
 	// update state
@@ -386,9 +454,9 @@ func (p *TxPool) Drop(tx *types.Transaction) {
 	)
 }
 
-//	Demote excludes an account from being further processed during block building
-//	due to a recoverable error. If an account has been demoted too many times (maxAccountDemotions),
-//	it is Dropped instead.
+// Demote excludes an account from being further processed during block building
+// due to a recoverable error. If an account has been demoted too many times (maxAccountDemotions),
+// it is Dropped instead.
 func (p *TxPool) Demote(tx *types.Transaction) {
 	account := p.accounts.get(tx.From)
 	if account.demotions == maxAccountDemotions {
@@ -399,7 +467,7 @@ func (p *TxPool) Demote(tx *types.Transaction) {
 
 		p.Drop(tx)
 
-		//	reset the demotions counter
+		// reset the demotions counter
 		account.demotions = 0
 
 		return
@@ -537,6 +605,11 @@ func (p *TxPool) validateTx(tx *types.Transaction) error {
 		tx.From = from
 	}
 
+	// Check if transaction can deploy smart contract
+	if tx.IsContractCreation() && !p.deploymentWhitelist.allowed(tx.From) {
+		return ErrSmartContractRestricted
+	}
+
 	// Reject underpriced transactions
 	if tx.IsUnderpriced(p.priceLimit) {
 		return ErrUnderpriced
@@ -580,6 +653,41 @@ func (p *TxPool) validateTx(tx *types.Transaction) error {
 	return nil
 }
 
+func (p *TxPool) signalPruning() {
+	select {
+	case p.pruneCh <- struct{}{}:
+	default: //	pruning handler is active or in cooldown
+	}
+}
+
+func (p *TxPool) pruneAccountsWithNonceHoles() {
+	p.accounts.Range(
+		func(_, value interface{}) bool {
+			account, _ := value.(*account)
+
+			account.enqueued.lock(true)
+			defer account.enqueued.unlock()
+
+			firstTx := account.enqueued.peek()
+
+			if firstTx == nil {
+				return true
+			}
+
+			if firstTx.Nonce == account.getNonce() {
+				return true
+			}
+
+			removed := account.enqueued.clear()
+
+			p.index.remove(removed...)
+			p.gauge.decrease(slotsRequired(removed...))
+
+			return true
+		},
+	)
+}
+
 // addTx is the main entry point to the pool
 // for all new transactions. If the call is
 // successful, an account is created for this address
@@ -595,6 +703,16 @@ func (p *TxPool) addTx(origin txOrigin, tx *types.Transaction) error {
 		return err
 	}
 
+	if p.gauge.highPressure() {
+		p.signalPruning()
+
+		//	only accept transactions with expected nonce
+		if account := p.accounts.get(tx.From); account != nil &&
+			tx.Nonce > account.getNonce() {
+			return ErrRejectFutureTx
+		}
+	}
+
 	// check for overflow
 	if p.gauge.read()+slotsRequired(tx) > p.gauge.max {
 		return ErrTxPoolOverflow
@@ -602,7 +720,7 @@ func (p *TxPool) addTx(origin txOrigin, tx *types.Transaction) error {
 
 	tx.ComputeHash()
 
-	//	add to index
+	// add to index
 	if ok := p.index.add(tx); !ok {
 		return ErrAlreadyKnown
 	}
@@ -719,7 +837,7 @@ func (p *TxPool) resetAccounts(stateNonces map[types.Address]uint64) {
 		allPrunedEnqueued []*types.Transaction
 	)
 
-	//	clear all accounts of stale txs
+	// clear all accounts of stale txs
 	for addr, newNonce := range stateNonces {
 		if !p.accounts.exists(addr) {
 			// no updates for this account
@@ -729,21 +847,21 @@ func (p *TxPool) resetAccounts(stateNonces map[types.Address]uint64) {
 		account := p.accounts.get(addr)
 		prunedPromoted, prunedEnqueued := account.reset(newNonce, p.promoteReqCh)
 
-		//	append pruned
+		// append pruned
 		allPrunedPromoted = append(allPrunedPromoted, prunedPromoted...)
 		allPrunedEnqueued = append(allPrunedEnqueued, prunedEnqueued...)
 
-		//	new state for account -> demotions are reset to 0
+		// new state for account -> demotions are reset to 0
 		account.demotions = 0
 	}
 
-	//	pool cleanup callback
+	// pool cleanup callback
 	cleanup := func(stale ...*types.Transaction) {
 		p.index.remove(stale...)
 		p.gauge.decrease(slotsRequired(stale...))
 	}
 
-	//	prune pool state
+	// prune pool state
 	if len(allPrunedPromoted) > 0 {
 		cleanup(allPrunedPromoted...)
 		p.eventManager.signalEvent(
@@ -781,7 +899,7 @@ func (p *TxPool) Length() uint64 {
 	return p.accounts.promoted()
 }
 
-//	toHash returns the hash(es) of given transaction(s)
+// toHash returns the hash(es) of given transaction(s)
 func toHash(txs ...*types.Transaction) (hashes []types.Hash) {
 	for _, tx := range txs {
 		hashes = append(hashes, tx.Hash)

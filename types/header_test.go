@@ -2,9 +2,10 @@ package types
 
 import (
 	"encoding/json"
-	"github.com/stretchr/testify/assert"
 	"regexp"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // TestHeader_JSON makes sure the Header is properly
@@ -13,7 +14,7 @@ func TestHeader_JSON(t *testing.T) {
 	t.Parallel()
 
 	var (
-		// nolint:lll
+		//nolint:lll
 		headerJSON = `{
 				"parentHash": "0x0100000000000000000000000000000000000000000000000000000000000000",
 				"sha3Uncles" : "0x0200000000000000000000000000000000000000000000000000000000000000",
@@ -35,7 +36,7 @@ func TestHeader_JSON(t *testing.T) {
 		header = Header{
 			ParentHash:   Hash{0x1},
 			Sha3Uncles:   Hash{0x2},
-			Miner:        Address{0x1},
+			Miner:        Address{0x1}.Bytes(),
 			StateRoot:    Hash{0x4},
 			TxRoot:       Hash{0x5},
 			ReceiptsRoot: Hash{0x6},

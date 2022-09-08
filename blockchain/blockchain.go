@@ -87,10 +87,9 @@ type Verifier interface {
 	VerifyHeader(header *types.Header) error
 	ProcessHeaders(headers []*types.Header) error
 	GetBlockCreator(header *types.Header) (types.Address, error)
-	PreStateCommit(header *types.Header, txn *state.Transition) error
+	PreCommitState(header *types.Header, txn *state.Transition) error
 }
 
-// 	TODO: this should be part of Verifier (consensus)
 type Executor interface {
 	ProcessBlock(parentRoot types.Hash, block *types.Block, blockCreator types.Address) (*state.Transition, error)
 }
@@ -106,7 +105,7 @@ func (b *Blockchain) updateGasPriceAvg(newValues []*big.Int) {
 	b.gpAverage.Lock()
 	defer b.gpAverage.Unlock()
 
-	//	Sum the values for quick reference
+	// Sum the values for quick reference
 	sum := big.NewInt(0)
 	for _, val := range newValues {
 		sum = sum.Add(sum, val)
@@ -844,7 +843,7 @@ func (b *Blockchain) executeBlockTransactions(block *types.Block) (*BlockResult,
 		return nil, err
 	}
 
-	if err := b.consensus.PreStateCommit(header, txn); err != nil {
+	if err := b.consensus.PreCommitState(header, txn); err != nil {
 		return nil, err
 	}
 
@@ -897,7 +896,7 @@ func (b *Blockchain) WriteBlock(block *types.Block, source string) error {
 		return err
 	}
 
-	//	update snapshot
+	// update snapshot
 	if err := b.consensus.ProcessHeaders([]*types.Header{header}); err != nil {
 		return err
 	}
