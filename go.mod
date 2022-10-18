@@ -32,7 +32,7 @@ require (
 	github.com/umbracle/fastrlp v0.0.0-20220527094140-59d5dd30e722
 	github.com/umbracle/go-eth-bn256 v0.0.0-20190607160430-b36caf4e0f6b
 	golang.org/x/crypto v0.0.0-20220525230936-793ad666bf5e
-	google.golang.org/grpc v1.50.0
+	google.golang.org/grpc v1.50.1
 	google.golang.org/protobuf v1.28.1
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce
 )
@@ -65,11 +65,7 @@ require (
 	go.uber.org/atomic v1.10.0
 )
 
-require (
-	github.com/0xPolygon/go-ibft v0.0.0-20220810095021-e43142f8d267
-	go.uber.org/atomic v1.10.0
-	gopkg.in/DataDog/dd-trace-go.v1 v1.42.1
-)
+require gopkg.in/DataDog/dd-trace-go.v1 v1.42.1
 
 require (
 	cloud.google.com/go v0.104.0 // indirect
