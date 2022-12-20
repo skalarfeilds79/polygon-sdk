@@ -335,8 +335,12 @@ func TestEth_Call(t *testing.T) {
 	})
 }
 
-type mockBlockStore struct {
+type testStore interface {
 	ethStore
+}
+
+type mockBlockStore struct {
+	testStore
 	blocks          []*types.Block
 	topics          []types.Hash
 	pendingTxns     []*types.Transaction
@@ -448,15 +452,6 @@ func (m *mockBlockStore) GetReceiptsByHash(hash types.Hash) ([]*types.Receipt, e
 	}
 
 	return receipts, nil
-}
-
-func (m *mockBlockStore) GetHeaderByNumber(blockNumber uint64) (*types.Header, bool) {
-	b, ok := m.GetBlockByNumber(blockNumber, false)
-	if !ok {
-		return nil, false
-	}
-
-	return b.Header, true
 }
 
 func (m *mockBlockStore) GetBlockByNumber(blockNumber uint64, full bool) (*types.Block, bool) {
