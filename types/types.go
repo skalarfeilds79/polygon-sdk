@@ -17,6 +17,8 @@ const (
 	AddressLength = 20
 )
 
+const SignatureSize = 4
+
 type Hash [HashLength]byte
 
 type Address [AddressLength]byte
@@ -86,11 +88,11 @@ func (a Address) Bytes() []byte {
 }
 
 func StringToHash(str string) Hash {
-	return BytesToHash(stringToBytes(str))
+	return BytesToHash(StringToBytes(str))
 }
 
 func StringToAddress(str string) Address {
-	return BytesToAddress(stringToBytes(str))
+	return BytesToAddress(StringToBytes(str))
 }
 
 func AddressToString(address Address) string {
@@ -108,7 +110,7 @@ func BytesToAddress(b []byte) Address {
 	return a
 }
 
-func stringToBytes(str string) []byte {
+func StringToBytes(str string) []byte {
 	str = strings.TrimPrefix(str, "0x")
 	if len(str)%2 == 1 {
 		str = "0" + str
@@ -121,14 +123,14 @@ func stringToBytes(str string) []byte {
 
 // UnmarshalText parses a hash in hex syntax.
 func (h *Hash) UnmarshalText(input []byte) error {
-	*h = BytesToHash(stringToBytes(string(input)))
+	*h = BytesToHash(StringToBytes(string(input)))
 
 	return nil
 }
 
 // UnmarshalText parses an address in hex syntax.
 func (a *Address) UnmarshalText(input []byte) error {
-	buf := stringToBytes(string(input))
+	buf := StringToBytes(string(input))
 	if len(buf) != AddressLength {
 		return fmt.Errorf("incorrect length")
 	}
@@ -153,3 +155,8 @@ var (
 	// EmptyUncleHash is the root when there are no uncles
 	EmptyUncleHash = StringToHash("0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347")
 )
+
+type Proof struct {
+	Data     []Hash // the proof himself
+	Metadata map[string]interface{}
+}
