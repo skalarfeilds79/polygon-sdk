@@ -7,17 +7,31 @@ import (
 	"math/big"
 	"os"
 
+	"github.com/hashicorp/go-multierror"
+	"github.com/umbracle/ethgo"
+
+	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/types"
-	"github.com/hashicorp/go-multierror"
 )
 
-var (
+const (
+	// GenesisBaseFeeEM is the initial base fee elasticity multiplier for EIP-1559 blocks.
+	GenesisBaseFeeEM = 2
+
 	// GenesisGasLimit is the default gas limit of the Genesis block.
 	GenesisGasLimit uint64 = 4712388
 
 	// GenesisDifficulty is the default difficulty of the Genesis block.
-	GenesisDifficulty = big.NewInt(131072)
+	GenesisDifficulty uint64 = 131072
+
+	// BaseFeeChangeDenom is the value to bound the amount the base fee can change between blocks
+	BaseFeeChangeDenom = uint64(8)
+)
+
+var (
+	// GenesisBaseFee is the initial base fee for EIP-1559 blocks.
+	GenesisBaseFee = ethgo.Gwei(1).Uint64()
 )
 
 // Chain is the blockchain chain configuration
@@ -30,8 +44,6 @@ type Chain struct {
 
 // Genesis specifies the header fields, state of a genesis block
 type Genesis struct {
-	Config *Params `json:"config"`
-
 	Nonce      [8]byte                           `json:"nonce"`
 	Timestamp  uint64                            `json:"timestamp"`
 	ExtraData  []byte                            `json:"extraData,omitempty"`
@@ -40,6 +52,11 @@ type Genesis struct {
 	Mixhash    types.Hash                        `json:"mixHash"`
 	Coinbase   types.Address                     `json:"coinbase"`
 	Alloc      map[types.Address]*GenesisAccount `json:"alloc,omitempty"`
+	BaseFee    uint64                            `json:"baseFee"`
+	BaseFeeEM  uint64                            `json:"baseFeeEM"`
+
+	// BaseFeeChangeDenom is the value to bound the amount the base fee can change between blocks
+	BaseFeeChangeDenom uint64 `json:"baseFeeChangeDenom,omitempty"`
 
 	// Override
 	StateRoot types.Hash
@@ -66,6 +83,7 @@ func (g *Genesis) GenesisHeader() *types.Header {
 		ExtraData:    g.ExtraData,
 		GasLimit:     g.GasLimit,
 		GasUsed:      g.GasUsed,
+		BaseFee:      g.BaseFee,
 		Difficulty:   g.Difficulty,
 		MixHash:      g.Mixhash,
 		Miner:        g.Coinbase.Bytes(),
@@ -81,7 +99,7 @@ func (g *Genesis) GenesisHeader() *types.Header {
 	}
 
 	if g.Difficulty == 0 {
-		head.Difficulty = GenesisDifficulty.Uint64()
+		head.Difficulty = GenesisDifficulty
 	}
 
 	return head
@@ -98,27 +116,33 @@ func (g *Genesis) Hash() types.Hash {
 // MarshalJSON implements the json interface
 func (g *Genesis) MarshalJSON() ([]byte, error) {
 	type Genesis struct {
-		Nonce      string                      `json:"nonce"`
-		Timestamp  *string                     `json:"timestamp,omitempty"`
-		ExtraData  *string                     `json:"extraData,omitempty"`
-		GasLimit   *string                     `json:"gasLimit,omitempty"`
-		Difficulty *string                     `json:"difficulty,omitempty"`
-		Mixhash    types.Hash                  `json:"mixHash"`
-		Coinbase   types.Address               `json:"coinbase"`
-		Alloc      *map[string]*GenesisAccount `json:"alloc,omitempty"`
-		Number     *string                     `json:"number,omitempty"`
-		GasUsed    *string                     `json:"gasUsed,omitempty"`
-		ParentHash types.Hash                  `json:"parentHash"`
+		Nonce              string                      `json:"nonce"`
+		Timestamp          *string                     `json:"timestamp,omitempty"`
+		ExtraData          *string                     `json:"extraData,omitempty"`
+		GasLimit           *string                     `json:"gasLimit,omitempty"`
+		Difficulty         *string                     `json:"difficulty,omitempty"`
+		Mixhash            types.Hash                  `json:"mixHash"`
+		Coinbase           types.Address               `json:"coinbase"`
+		Alloc              *map[string]*GenesisAccount `json:"alloc,omitempty"`
+		Number             *string                     `json:"number,omitempty"`
+		GasUsed            *string                     `json:"gasUsed,omitempty"`
+		ParentHash         types.Hash                  `json:"parentHash"`
+		BaseFee            *string                     `json:"baseFee"`
+		BaseFeeEM          *string                     `json:"baseFeeEM"`
+		BaseFeeChangeDenom *string                     `json:"baseFeeChangeDenom"`
 	}
 
 	var enc Genesis
 	enc.Nonce = hex.EncodeToHex(g.Nonce[:])
 
-	enc.Timestamp = types.EncodeUint64(g.Timestamp)
-	enc.ExtraData = types.EncodeBytes(g.ExtraData)
+	enc.Timestamp = common.EncodeUint64(g.Timestamp)
+	enc.ExtraData = common.EncodeBytes(g.ExtraData)
 
-	enc.GasLimit = types.EncodeUint64(g.GasLimit)
-	enc.Difficulty = types.EncodeUint64(g.Difficulty)
+	enc.GasLimit = common.EncodeUint64(g.GasLimit)
+	enc.Difficulty = common.EncodeUint64(g.Difficulty)
+	enc.BaseFee = common.EncodeUint64(g.BaseFee)
+	enc.BaseFeeEM = common.EncodeUint64(g.BaseFeeEM)
+	enc.BaseFeeChangeDenom = common.EncodeUint64(g.BaseFeeChangeDenom)
 
 	enc.Mixhash = g.Mixhash
 	enc.Coinbase = g.Coinbase
@@ -132,8 +156,8 @@ func (g *Genesis) MarshalJSON() ([]byte, error) {
 		enc.Alloc = &alloc
 	}
 
-	enc.Number = types.EncodeUint64(g.Number)
-	enc.GasUsed = types.EncodeUint64(g.GasUsed)
+	enc.Number = common.EncodeUint64(g.Number)
+	enc.GasUsed = common.EncodeUint64(g.GasUsed)
 	enc.ParentHash = g.ParentHash
 
 	return json.Marshal(&enc)
@@ -142,17 +166,20 @@ func (g *Genesis) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON implements the json interface
 func (g *Genesis) UnmarshalJSON(data []byte) error {
 	type Genesis struct {
-		Nonce      *string                    `json:"nonce"`
-		Timestamp  *string                    `json:"timestamp"`
-		ExtraData  *string                    `json:"extraData"`
-		GasLimit   *string                    `json:"gasLimit"`
-		Difficulty *string                    `json:"difficulty"`
-		Mixhash    *types.Hash                `json:"mixHash"`
-		Coinbase   *types.Address             `json:"coinbase"`
-		Alloc      map[string]*GenesisAccount `json:"alloc"`
-		Number     *string                    `json:"number"`
-		GasUsed    *string                    `json:"gasUsed"`
-		ParentHash *types.Hash                `json:"parentHash"`
+		Nonce              *string                    `json:"nonce"`
+		Timestamp          *string                    `json:"timestamp"`
+		ExtraData          *string                    `json:"extraData"`
+		GasLimit           *string                    `json:"gasLimit"`
+		Difficulty         *string                    `json:"difficulty"`
+		Mixhash            *types.Hash                `json:"mixHash"`
+		Coinbase           *types.Address             `json:"coinbase"`
+		Alloc              map[string]*GenesisAccount `json:"alloc"`
+		Number             *string                    `json:"number"`
+		GasUsed            *string                    `json:"gasUsed"`
+		ParentHash         *types.Hash                `json:"parentHash"`
+		BaseFee            *string                    `json:"baseFee"`
+		BaseFeeEM          *string                    `json:"baseFeeEM"`
+		BaseFeeChangeDenom *string                    `json:"baseFeeChangeDenom"`
 	}
 
 	var dec Genesis
@@ -166,20 +193,20 @@ func (g *Genesis) UnmarshalJSON(data []byte) error {
 		err = multierror.Append(err, fmt.Errorf("%s: %w", field, subErr))
 	}
 
-	nonce, subErr := types.ParseUint64orHex(dec.Nonce)
+	nonce, subErr := common.ParseUint64orHex(dec.Nonce)
 	if subErr != nil {
 		parseError("nonce", subErr)
 	}
 
 	binary.BigEndian.PutUint64(g.Nonce[:], nonce)
 
-	g.Timestamp, subErr = types.ParseUint64orHex(dec.Timestamp)
+	g.Timestamp, subErr = common.ParseUint64orHex(dec.Timestamp)
 	if subErr != nil {
 		parseError("timestamp", subErr)
 	}
 
 	if dec.ExtraData != nil {
-		g.ExtraData, subErr = types.ParseBytes(dec.ExtraData)
+		g.ExtraData, subErr = common.ParseBytes(dec.ExtraData)
 		if subErr != nil {
 			parseError("extradata", subErr)
 		}
@@ -189,14 +216,29 @@ func (g *Genesis) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("field 'gaslimit' is required")
 	}
 
-	g.GasLimit, subErr = types.ParseUint64orHex(dec.GasLimit)
+	g.GasLimit, subErr = common.ParseUint64orHex(dec.GasLimit)
 	if subErr != nil {
 		parseError("gaslimit", subErr)
 	}
 
-	g.Difficulty, subErr = types.ParseUint64orHex(dec.Difficulty)
+	g.Difficulty, subErr = common.ParseUint64orHex(dec.Difficulty)
 	if subErr != nil {
 		parseError("difficulty", subErr)
+	}
+
+	g.BaseFee, subErr = common.ParseUint64orHex(dec.BaseFee)
+	if subErr != nil {
+		parseError("baseFee", subErr)
+	}
+
+	g.BaseFeeEM, subErr = common.ParseUint64orHex(dec.BaseFeeEM)
+	if subErr != nil {
+		parseError("baseFeeEM", subErr)
+	}
+
+	g.BaseFeeChangeDenom, subErr = common.ParseUint64orHex(dec.BaseFeeChangeDenom)
+	if subErr != nil {
+		parseError("baseFeeChangeDenom", subErr)
 	}
 
 	if dec.Mixhash != nil {
@@ -214,12 +256,12 @@ func (g *Genesis) UnmarshalJSON(data []byte) error {
 		}
 	}
 
-	g.Number, subErr = types.ParseUint64orHex(dec.Number)
+	g.Number, subErr = common.ParseUint64orHex(dec.Number)
 	if subErr != nil {
 		parseError("number", subErr)
 	}
 
-	g.GasUsed, subErr = types.ParseUint64orHex(dec.GasUsed)
+	g.GasUsed, subErr = common.ParseUint64orHex(dec.GasUsed)
 	if subErr != nil {
 		parseError("gasused", subErr)
 	}
@@ -256,7 +298,7 @@ func (g *GenesisAccount) MarshalJSON() ([]byte, error) {
 	obj := &genesisAccountEncoder{}
 
 	if g.Code != nil {
-		obj.Code = types.EncodeBytes(g.Code)
+		obj.Code = common.EncodeBytes(g.Code)
 	}
 
 	if len(g.Storage) != 0 {
@@ -264,15 +306,15 @@ func (g *GenesisAccount) MarshalJSON() ([]byte, error) {
 	}
 
 	if g.Balance != nil {
-		obj.Balance = types.EncodeBigInt(g.Balance)
+		obj.Balance = common.EncodeBigInt(g.Balance)
 	}
 
 	if g.Nonce != 0 {
-		obj.Nonce = types.EncodeUint64(g.Nonce)
+		obj.Nonce = common.EncodeUint64(g.Nonce)
 	}
 
 	if g.PrivateKey != nil {
-		obj.PrivateKey = types.EncodeBytes(g.PrivateKey)
+		obj.PrivateKey = common.EncodeBytes(g.PrivateKey)
 	}
 
 	return json.Marshal(obj)
@@ -303,7 +345,7 @@ func (g *GenesisAccount) UnmarshalJSON(data []byte) error {
 	}
 
 	if dec.Code != nil {
-		g.Code, subErr = types.ParseBytes(dec.Code)
+		g.Code, subErr = common.ParseBytes(dec.Code)
 		if subErr != nil {
 			parseError("code", subErr)
 		}
@@ -313,19 +355,19 @@ func (g *GenesisAccount) UnmarshalJSON(data []byte) error {
 		g.Storage = dec.Storage
 	}
 
-	g.Balance, subErr = types.ParseUint256orHex(dec.Balance)
+	g.Balance, subErr = common.ParseUint256orHex(dec.Balance)
 	if subErr != nil {
 		parseError("balance", subErr)
 	}
 
-	g.Nonce, subErr = types.ParseUint64orHex(dec.Nonce)
+	g.Nonce, subErr = common.ParseUint64orHex(dec.Nonce)
 
 	if subErr != nil {
 		parseError("nonce", subErr)
 	}
 
 	if dec.PrivateKey != nil {
-		g.PrivateKey, subErr = types.ParseBytes(dec.PrivateKey)
+		g.PrivateKey, subErr = common.ParseBytes(dec.PrivateKey)
 		if subErr != nil {
 			parseError("privatekey", subErr)
 		}
@@ -360,14 +402,4 @@ func importChain(content []byte) (*Chain, error) {
 	}
 
 	return chain, nil
-}
-
-// GetGenesisAccountBalance returns balance for genesis account based on its address (expressed in weis).
-// If not found in provided allocations map, 0 is returned.
-func GetGenesisAccountBalance(address types.Address, allocations map[types.Address]*GenesisAccount) (*big.Int, error) {
-	if genesisAcc, ok := allocations[address]; ok {
-		return genesisAcc.Balance, nil
-	}
-
-	return nil, fmt.Errorf("genesis account %s is not found among genesis allocations", address)
 }

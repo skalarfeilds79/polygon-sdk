@@ -206,8 +206,11 @@ func (s *Server) setupDiscovery() error {
 
 	// Set the PeerAdded event handler
 	routingTable.PeerAdded = func(p peer.ID) {
-		info := s.host.Peerstore().PeerInfo(p)
-		s.addToDialQueue(&info, common.PriorityRandomDial)
+		// spawn routine because PeerAdded is called from event handler and s.addToDialQueue emits event again
+		go func() {
+			info := s.host.Peerstore().PeerInfo(p)
+			s.addToDialQueue(&info, common.PriorityRandomDial)
+		}()
 	}
 
 	// Set the PeerRemoved event handler
@@ -223,8 +226,8 @@ func (s *Server) setupDiscovery() error {
 	)
 
 	// Register a network event handler
-	if subscribeErr := s.SubscribeFn(context.Background(), discoveryService.HandleNetworkEvent); subscribeErr != nil {
-		return fmt.Errorf("unable to subscribe to network events, %w", subscribeErr)
+	if err := s.Subscribe(context.Background(), discoveryService.HandleNetworkEvent); err != nil {
+		return fmt.Errorf("unable to subscribe to network events, %w", err)
 	}
 
 	// Register the actual discovery service as a valid protocol

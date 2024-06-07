@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/validator"
 	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
+	bolt "go.etcd.io/bbolt"
 )
 
 var (
@@ -19,8 +21,13 @@ var (
 
 // PrioritizedValidator holds ValidatorMetadata together with priority
 type PrioritizedValidator struct {
-	Metadata         *ValidatorMetadata
+	Metadata         *validator.ValidatorMetadata
 	ProposerPriority *big.Int
+}
+
+func (pv PrioritizedValidator) String() string {
+	return fmt.Sprintf("[%v, voting power %v, priority %v]", pv.Metadata.Address.String(),
+		pv.Metadata.VotingPower, pv.ProposerPriority)
 }
 
 // ProposerSnapshot represents snapshot of one proposer calculation
@@ -32,15 +39,15 @@ type ProposerSnapshot struct {
 }
 
 // NewProposerSnapshotFromState create ProposerSnapshot from state if possible or from genesis block
-func NewProposerSnapshotFromState(config *runtimeConfig) (*ProposerSnapshot, error) {
-	snapshot, err := config.State.ProposerSnapshotStore.getProposerSnapshot()
+func NewProposerSnapshotFromState(config *runtimeConfig, dbTx *bolt.Tx) (*ProposerSnapshot, error) {
+	snapshot, err := config.State.ProposerSnapshotStore.getProposerSnapshot(dbTx)
 	if err != nil {
 		return nil, err
 	}
 
 	if snapshot == nil {
 		// pick validator set from genesis block if snapshot is not saved in db
-		genesisValidatorsSet, err := config.polybftBackend.GetValidators(0, nil)
+		genesisValidatorsSet, err := config.polybftBackend.GetValidatorsWithTx(0, nil, dbTx)
 		if err != nil {
 			return nil, err
 		}
@@ -52,7 +59,7 @@ func NewProposerSnapshotFromState(config *runtimeConfig) (*ProposerSnapshot, err
 }
 
 // NewProposerSnapshot creates ProposerSnapshot with height and validators with all priorities set to zero
-func NewProposerSnapshot(height uint64, validators []*ValidatorMetadata) *ProposerSnapshot {
+func NewProposerSnapshot(height uint64, validators []*validator.ValidatorMetadata) *ProposerSnapshot {
 	validatorsSnap := make([]*PrioritizedValidator, len(validators))
 
 	for i, x := range validators {
@@ -159,19 +166,31 @@ type ProposerCalculator struct {
 }
 
 // NewProposerCalculator creates a new proposer calculator object
-func NewProposerCalculator(config *runtimeConfig, logger hclog.Logger) (*ProposerCalculator, error) {
-	snap, err := NewProposerSnapshotFromState(config)
+func NewProposerCalculator(config *runtimeConfig, logger hclog.Logger,
+	dbTx *bolt.Tx) (*ProposerCalculator, error) {
+	snap, err := NewProposerSnapshotFromState(config, dbTx)
 
 	if err != nil {
 		return nil, err
 	}
 
-	return &ProposerCalculator{
+	pc := &ProposerCalculator{
 		snapshot: snap,
 		config:   config,
 		state:    config.State,
 		logger:   logger,
-	}, nil
+	}
+
+	// If the node was previously stopped, leaving the proposer calculator in an inconsistent state,
+	// proposer calculator needs to be updated.
+	blockNumber := config.blockchain.CurrentHeader().Number
+	if pc.snapshot.Height <= blockNumber {
+		if err = pc.update(blockNumber, dbTx); err != nil {
+			return nil, err
+		}
+	}
+
+	return pc, nil
 }
 
 // NewProposerCalculator creates a new proposer calculator object
@@ -197,7 +216,10 @@ func (pc *ProposerCalculator) GetSnapshot() (*ProposerSnapshot, bool) {
 // PostBlock is called on every insert of finalized block (either from consensus or syncer)
 // It will update priorities and save the updated snapshot to db
 func (pc *ProposerCalculator) PostBlock(req *PostBlockRequest) error {
-	blockNumber := req.FullBlock.Block.Number()
+	return pc.update(req.FullBlock.Block.Number(), req.DBTx)
+}
+
+func (pc *ProposerCalculator) update(blockNumber uint64, dbTx *bolt.Tx) error {
 	pc.logger.Debug("Update proposers snapshot started", "target block", blockNumber)
 
 	from := pc.snapshot.Height
@@ -206,25 +228,26 @@ func (pc *ProposerCalculator) PostBlock(req *PostBlockRequest) error {
 	// so that we can recalculate it to have accurate priorities.
 	// Note, this will change once we introduce component wide global transaction
 	for height := from; height <= blockNumber; height++ {
-		if err := pc.updatePerBlock(height); err != nil {
+		if err := pc.updatePerBlock(height, dbTx); err != nil {
 			return err
 		}
 
-		pc.logger.Debug("Proposers snapshot has been updated", "current block", blockNumber+1,
-			"validators count", len(pc.snapshot.Validators))
+		pc.logger.Debug("Proposer snapshot has been updated",
+			"block", height, "validators", pc.snapshot.Validators)
 	}
 
-	if err := pc.state.ProposerSnapshotStore.writeProposerSnapshot(pc.snapshot); err != nil {
+	if err := pc.state.ProposerSnapshotStore.writeProposerSnapshot(pc.snapshot, dbTx); err != nil {
 		return fmt.Errorf("cannot save proposers snapshot for block %d: %w", blockNumber, err)
 	}
 
-	pc.logger.Debug("Update proposers snapshot finished", "target block", blockNumber)
+	pc.logger.Info("Proposer snapshot update has been finished",
+		"target block", blockNumber+1, "validators", len(pc.snapshot.Validators))
 
 	return nil
 }
 
 // Updates ProposerSnapshot to block block with number `blockNumber`
-func (pc *ProposerCalculator) updatePerBlock(blockNumber uint64) error {
+func (pc *ProposerCalculator) updatePerBlock(blockNumber uint64, dbTx *bolt.Tx) error {
 	if pc.snapshot.Height != blockNumber {
 		return fmt.Errorf("proposers snapshot update called for wrong block. block number=%d, snapshot block number=%d",
 			blockNumber, pc.snapshot.Height)
@@ -235,10 +258,10 @@ func (pc *ProposerCalculator) updatePerBlock(blockNumber uint64) error {
 		return fmt.Errorf("cannot get block header and extra while updating proposers snapshot %d: %w", blockNumber, err)
 	}
 
-	var newValidatorSet AccountSet = nil
+	var newValidatorSet validator.AccountSet = nil
 
 	if extra.Validators != nil && !extra.Validators.IsEmpty() {
-		newValidatorSet, err = pc.config.polybftBackend.GetValidators(blockNumber, nil)
+		newValidatorSet, err = pc.config.polybftBackend.GetValidatorsWithTx(blockNumber, nil, dbTx)
 		if err != nil {
 			return fmt.Errorf("cannot get validators for block %d: %w", blockNumber, err)
 		}
@@ -294,7 +317,7 @@ func incrementProposerPriorityNTimes(snapshot *ProposerSnapshot, times uint64) (
 	return proposer, nil
 }
 
-func updateValidators(snapshot *ProposerSnapshot, newValidatorSet AccountSet) error {
+func updateValidators(snapshot *ProposerSnapshot, newValidatorSet validator.AccountSet) error {
 	if newValidatorSet.Len() == 0 {
 		return nil
 	}

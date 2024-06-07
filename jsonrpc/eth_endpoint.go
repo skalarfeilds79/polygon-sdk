@@ -1,14 +1,15 @@
 package jsonrpc
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
 
 	"github.com/hashicorp/go-hclog"
-	"github.com/umbracle/fastrlp"
 
 	"github.com/0xPolygon/polygon-edge/chain"
+	"github.com/0xPolygon/polygon-edge/gasprice"
 	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/helper/progress"
 	"github.com/0xPolygon/polygon-edge/state"
@@ -25,6 +26,9 @@ type ethTxPoolStore interface {
 
 	// GetNonce returns the next nonce for this address
 	GetNonce(addr types.Address) uint64
+
+	// GetBaseFee returns the current base fee of TxPool
+	GetBaseFee() uint64
 }
 
 type Account struct {
@@ -62,10 +66,20 @@ type ethBlockchainStore interface {
 	GetAvgGasPrice() *big.Int
 
 	// ApplyTxn applies a transaction object to the blockchain
-	ApplyTxn(header *types.Header, txn *types.Transaction) (*runtime.ExecutionResult, error)
+	ApplyTxn(
+		header *types.Header,
+		txn *types.Transaction,
+		override types.StateOverride,
+		nonPayable bool,
+	) (*runtime.ExecutionResult, error)
 
 	// GetSyncProgression retrieves the current sync progression, if any
 	GetSyncProgression() *progress.Progression
+}
+
+type ethFilter interface {
+	// FilterExtra filters extra data from header extra that is not included in block hash
+	FilterExtra(extra []byte) ([]byte, error)
 }
 
 // ethStore provides access to the methods needed by eth endpoint
@@ -73,6 +87,8 @@ type ethStore interface {
 	ethTxPoolStore
 	ethStateStore
 	ethBlockchainStore
+	ethFilter
+	gasprice.GasStore
 }
 
 // Eth is the eth jsonrpc endpoint
@@ -122,6 +138,10 @@ func (e *Eth) GetBlockByNumber(number BlockNumber, fullTx bool) (interface{}, er
 		return nil, nil
 	}
 
+	if err := e.filterExtra(block); err != nil {
+		return nil, err
+	}
+
 	return toBlock(block, fullTx), nil
 }
 
@@ -132,7 +152,28 @@ func (e *Eth) GetBlockByHash(hash types.Hash, fullTx bool) (interface{}, error) 
 		return nil, nil
 	}
 
+	if err := e.filterExtra(block); err != nil {
+		return nil, err
+	}
+
 	return toBlock(block, fullTx), nil
+}
+
+func (e *Eth) filterExtra(block *types.Block) error {
+	// we need to copy it because the store returns header from storage directly
+	// and not a copy, so changing it, actually changes it in storage as well
+	headerCopy := block.Header.Copy()
+
+	filteredExtra, err := e.store.FilterExtra(headerCopy.ExtraData)
+	if err != nil {
+		return err
+	}
+
+	headerCopy.ExtraData = filteredExtra
+	// no need to recompute hash (filtered out data is not in the hash in the first place)
+	block.Header = headerCopy
+
+	return nil
 }
 
 func (e *Eth) GetBlockTransactionCountByNumber(number BlockNumber) (interface{}, error) {
@@ -147,7 +188,7 @@ func (e *Eth) GetBlockTransactionCountByNumber(number BlockNumber) (interface{},
 		return nil, nil
 	}
 
-	return len(block.Transactions), nil
+	return *common.EncodeUint64(uint64(len(block.Transactions))), nil
 }
 
 // BlockNumber returns current block number
@@ -167,8 +208,7 @@ func (e *Eth) SendRawTransaction(buf argBytes) (interface{}, error) {
 		return nil, err
 	}
 
-	tx.ComputeHash()
-
+	// tx hash will be calculated inside e.store.AddTx
 	if err := e.store.AddTx(tx); err != nil {
 		return nil, err
 	}
@@ -179,7 +219,7 @@ func (e *Eth) SendRawTransaction(buf argBytes) (interface{}, error) {
 // SendTransaction rejects eth_sendTransaction json-rpc call as we don't support wallet management
 func (e *Eth) SendTransaction(_ *txnArgs) (interface{}, error) {
 	return nil, fmt.Errorf("request calls to eth_sendTransaction method are not supported," +
-		" use eth_sendRawTransaction insead")
+		" use eth_sendRawTransaction instead")
 }
 
 // GetTransactionByHash returns a transaction by its hash.
@@ -197,22 +237,21 @@ func (e *Eth) GetTransactionByHash(hash types.Hash) (interface{}, error) {
 		}
 
 		block, ok := e.store.GetBlockByHash(blockHash, true)
-
 		if !ok {
 			// Block receipts not found in storage
 			return nil
 		}
 
 		// Find the transaction within the block
-		for idx, txn := range block.Transactions {
-			if txn.Hash == hash {
-				return toTransaction(
-					txn,
-					argUintPtr(block.Number()),
-					argHashPtr(block.Hash()),
-					&idx,
-				)
-			}
+		if txn, idx := types.FindTxByHash(block.Transactions, hash); txn != nil {
+			txn.GasPrice = txn.GetGasPrice(block.Header.BaseFee)
+
+			return toTransaction(
+				txn,
+				argUintPtr(block.Number()),
+				argHashPtr(block.Hash()),
+				&idx,
+			)
 		}
 
 		return nil
@@ -285,56 +324,24 @@ func (e *Eth) GetTransactionReceipt(hash types.Hash) (interface{}, error) {
 		return nil, nil
 	}
 	// find the transaction in the body
-	indx := -1
+	logIndex := 0
+	txn, txIndex := types.FindTxByHash(block.Transactions, hash)
 
-	for i, txn := range block.Transactions {
-		if txn.Hash == hash {
-			indx = i
-
-			break
-		}
-	}
-
-	if indx == -1 {
+	if txIndex == -1 {
 		// txn not found
 		return nil, nil
 	}
 
-	txn := block.Transactions[indx]
-	raw := receipts[indx]
-
-	logs := make([]*Log, len(raw.Logs))
-	for indx, elem := range raw.Logs {
-		logs[indx] = &Log{
-			Address:     elem.Address,
-			Topics:      elem.Topics,
-			Data:        argBytes(elem.Data),
-			BlockHash:   block.Hash(),
-			BlockNumber: argUint64(block.Number()),
-			TxHash:      txn.Hash,
-			TxIndex:     argUint64(indx),
-			LogIndex:    argUint64(indx),
-			Removed:     false,
-		}
+	for i := 0; i < txIndex; i++ {
+		// accumulate receipt logs indexes from block transactions
+		// that are before the desired transaction
+		logIndex += len(receipts[i].Logs)
 	}
 
-	res := &receipt{
-		Root:              raw.Root,
-		CumulativeGasUsed: argUint64(raw.CumulativeGasUsed),
-		LogsBloom:         raw.LogsBloom,
-		Status:            argUint64(*raw.Status),
-		TxHash:            txn.Hash,
-		TxIndex:           argUint64(indx),
-		BlockHash:         block.Hash(),
-		BlockNumber:       argUint64(block.Number()),
-		GasUsed:           argUint64(raw.GasUsed),
-		ContractAddress:   raw.ContractAddress,
-		FromAddr:          txn.From,
-		ToAddr:            txn.To,
-		Logs:              logs,
-	}
+	raw := receipts[txIndex]
+	logs := toLogs(raw.Logs, uint64(logIndex), uint64(txIndex), block.Header, hash)
 
-	return res, nil
+	return toReceipt(raw, txn, uint64(txIndex), block.Header, logs), nil
 }
 
 // GetStorageAt returns the contract storage at the index position
@@ -358,61 +365,134 @@ func (e *Eth) GetStorageAt(
 		return nil, err
 	}
 
-	//nolint:godox
-	// TODO: GetStorage should return the values already parsed (to be fixed in EVM-522)
-
-	// Parse the RLP value
-	p := &fastrlp.Parser{}
-
-	v, err := p.Parse(result)
-	if err != nil {
-		return argBytesPtr(types.ZeroHash[:]), nil
-	}
-
-	data, err := v.Bytes()
-	if err != nil {
-		return argBytesPtr(types.ZeroHash[:]), nil
-	}
-
-	// Pad to return 32 bytes data
-	return argBytesPtr(types.BytesToHash(data).Bytes()), nil
+	return argBytesPtr(result), nil
 }
 
-// GasPrice returns the average gas price based on the last x blocks
-// taking into consideration operator defined price limit
+// GasPrice exposes "getGasPrice"'s function logic to public RPC interface
 func (e *Eth) GasPrice() (interface{}, error) {
+	gasPrice, err := e.getGasPrice()
+	if err != nil {
+		return nil, err
+	}
+
+	return argUint64(gasPrice), nil
+}
+
+// getGasPrice returns the average gas price based on the last x blocks
+// taking into consideration operator defined price limit
+func (e *Eth) getGasPrice() (uint64, error) {
+	// Return --price-limit flag defined value if it is greater than avgGasPrice/baseFee+priorityFee
+	if e.store.GetForksInTime(e.store.Header().Number).London {
+		priorityFee, err := e.store.MaxPriorityFeePerGas()
+		if err != nil {
+			return 0, err
+		}
+
+		return common.Max(e.priceLimit, priorityFee.Uint64()+e.store.GetBaseFee()), nil
+	}
+
 	// Fetch average gas price in uint64
 	avgGasPrice := e.store.GetAvgGasPrice().Uint64()
 
-	// Return --price-limit flag defined value if it is greater than avgGasPrice
-	return argUint64(common.Max(e.priceLimit, avgGasPrice)), nil
+	return common.Max(e.priceLimit, avgGasPrice), nil
 }
 
+// fillTransactionGasPrice fills transaction gas price if no provided
+func (e *Eth) fillTransactionGasPrice(tx *types.Transaction) error {
+	if tx.GetGasPrice(e.store.GetBaseFee()).BitLen() > 0 {
+		return nil
+	}
+
+	estimatedGasPrice, err := e.getGasPrice()
+	if err != nil {
+		return err
+	}
+
+	if tx.Type == types.DynamicFeeTx {
+		tx.GasFeeCap = new(big.Int).SetUint64(estimatedGasPrice)
+	} else {
+		tx.GasPrice = new(big.Int).SetUint64(estimatedGasPrice)
+	}
+
+	return nil
+}
+
+type overrideAccount struct {
+	Nonce     *argUint64                 `json:"nonce"`
+	Code      *argBytes                  `json:"code"`
+	Balance   *argUint64                 `json:"balance"`
+	State     *map[types.Hash]types.Hash `json:"state"`
+	StateDiff *map[types.Hash]types.Hash `json:"stateDiff"`
+}
+
+func (o *overrideAccount) ToType() types.OverrideAccount {
+	res := types.OverrideAccount{}
+
+	if o.Nonce != nil {
+		res.Nonce = (*uint64)(o.Nonce)
+	}
+
+	if o.Code != nil {
+		res.Code = *o.Code
+	}
+
+	if o.Balance != nil {
+		res.Balance = new(big.Int).SetUint64(*(*uint64)(o.Balance))
+	}
+
+	if o.State != nil {
+		res.State = *o.State
+	}
+
+	if o.StateDiff != nil {
+		res.StateDiff = *o.StateDiff
+	}
+
+	return res
+}
+
+// StateOverride is the collection of overridden accounts.
+type stateOverride map[types.Address]overrideAccount
+
 // Call executes a smart contract call using the transaction object data
-func (e *Eth) Call(arg *txnArgs, filter BlockNumberOrHash) (interface{}, error) {
+func (e *Eth) Call(arg *txnArgs, filter BlockNumberOrHash, apiOverride *stateOverride) (interface{}, error) {
 	header, err := GetHeaderFromBlockNumberOrHash(filter, e.store)
 	if err != nil {
 		return nil, err
 	}
 
-	transaction, err := DecodeTxn(arg, e.store)
+	transaction, err := DecodeTxn(arg, header.Number, e.store, true)
 	if err != nil {
 		return nil, err
 	}
+
 	// If the caller didn't supply the gas limit in the message, then we set it to maximum possible => block gas limit
 	if transaction.Gas == 0 {
 		transaction.Gas = header.GasLimit
 	}
 
+	// Force transaction gas price if empty
+	if err = e.fillTransactionGasPrice(transaction); err != nil {
+		return nil, err
+	}
+
+	var override types.StateOverride
+	if apiOverride != nil {
+		override = types.StateOverride{}
+		for addr, o := range *apiOverride {
+			override[addr] = o.ToType()
+		}
+	}
+
 	// The return value of the execution is saved in the transition (returnValue field)
-	result, err := e.store.ApplyTxn(header, transaction)
+	result, err := e.store.ApplyTxn(header, transaction, override, true)
 	if err != nil {
 		return nil, err
 	}
 
 	// Check if an EVM revert happened
 	if result.Reverted() {
-		return nil, constructErrorFromRevert(result)
+		return []byte(hex.EncodeToString(result.ReturnValue)), constructErrorFromRevert(result)
 	}
 
 	if result.Failed() {
@@ -424,11 +504,6 @@ func (e *Eth) Call(arg *txnArgs, filter BlockNumberOrHash) (interface{}, error) 
 
 // EstimateGas estimates the gas needed to execute a transaction
 func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error) {
-	transaction, err := DecodeTxn(arg, e.store)
-	if err != nil {
-		return nil, err
-	}
-
 	number := LatestBlockNumber
 	if rawNum != nil {
 		number = *rawNum
@@ -440,7 +515,29 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 		return nil, err
 	}
 
-	forksInTime := e.store.GetForksInTime(uint64(number))
+	// testTransaction should execute tx with nonce always set to the current expected nonce for the account
+	transaction, err := DecodeTxn(arg, header.Number, e.store, true)
+	if err != nil {
+		return nil, err
+	}
+
+	forksInTime := e.store.GetForksInTime(header.Number)
+
+	if transaction.IsValueTransfer() {
+		// if it is a simple value transfer or a contract creation,
+		// we already know what is the transaction gas cost, no need to apply transaction
+		gasCost, err := state.TransactionGasCost(transaction, forksInTime.Homestead, forksInTime.Istanbul)
+		if err != nil {
+			return nil, err
+		}
+
+		return argUint64(gasCost), nil
+	}
+
+	// Force transaction gas price if empty
+	if err = e.fillTransactionGasPrice(transaction); err != nil {
+		return nil, err
+	}
 
 	var standardGas uint64
 	if transaction.IsContractCreation() && forksInTime.Homestead {
@@ -463,7 +560,6 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 	}
 
 	gasPriceInt := new(big.Int).Set(transaction.GasPrice)
-	valueInt := new(big.Int).Set(transaction.Value)
 
 	var availableBalance *big.Int
 
@@ -486,14 +582,6 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 		}
 
 		availableBalance = new(big.Int).Set(accountBalance)
-
-		if transaction.Value != nil {
-			if valueInt.Cmp(availableBalance) > 0 {
-				return 0, ErrInsufficientFunds
-			}
-
-			availableBalance.Sub(availableBalance, valueInt)
-		}
 	}
 
 	// Recalculate the gas ceiling based on the available funds (if any)
@@ -518,14 +606,21 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 
 	// Checks if executor level valid gas errors occurred
 	isGasApplyError := func(err error) bool {
-		// Not linting this as the underlying error is actually wrapped
-		return errors.Is(err, state.ErrNotEnoughIntrinsicGas)
+		if errors.Is(err, state.ErrNotEnoughIntrinsicGas) {
+			return true
+		}
+
+		var expected *state.TransitionApplicationError
+		if errors.As(err, &expected) {
+			return errors.Is(expected.Err, state.ErrNotEnoughIntrinsicGas)
+		}
+
+		return false
 	}
 
 	// Checks if EVM level valid gas errors occurred
 	isGasEVMError := func(err error) bool {
-		return errors.Is(err, runtime.ErrOutOfGas) ||
-			errors.Is(err, runtime.ErrCodeStoreOutOfGas)
+		return errors.Is(err, runtime.ErrOutOfGas) || errors.Is(err, runtime.ErrCodeStoreOutOfGas)
 	}
 
 	// Checks if the EVM reverted during execution
@@ -534,13 +629,17 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 	}
 
 	// Run the transaction with the specified gas value.
-	// Returns a status indicating if the transaction failed and the accompanying error
-	testTransaction := func(gas uint64, shouldOmitErr bool) (bool, error) {
-		// Create a dummy transaction with the new gas
-		txn := transaction.Copy()
-		txn.Gas = gas
+	// Returns a status indicating if the transaction failed, return value (data), and the accompanying error
+	testTransaction := func(gas uint64, shouldOmitErr bool) (bool, interface{}, error) {
+		var data interface{}
 
-		result, applyErr := e.store.ApplyTxn(header, txn)
+		transaction.Gas = gas
+
+		result, applyErr := e.store.ApplyTxn(header, transaction, nil, true)
+
+		if result != nil {
+			data = []byte(hex.EncodeToString(result.ReturnValue))
+		}
 
 		if applyErr != nil {
 			// Check the application error.
@@ -549,10 +648,10 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 				// Specifying the transaction failed, but not providing an error
 				// is an indication that a valid error occurred due to low gas,
 				// which will increase the lower bound for the search
-				return true, nil
+				return true, data, nil
 			}
 
-			return true, applyErr
+			return true, data, applyErr
 		}
 
 		// Check if an out of gas error happened during EVM execution
@@ -561,31 +660,30 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 				// Specifying the transaction failed, but not providing an error
 				// is an indication that a valid error occurred due to low gas,
 				// which will increase the lower bound for the search
-				return true, nil
+				return true, data, nil
 			}
 
 			if isEVMRevertError(result.Err) {
 				// The EVM reverted during execution, attempt to extract the
 				// error message and return it
-				return true, constructErrorFromRevert(result)
+				return true, data, constructErrorFromRevert(result)
 			}
 
-			return true, result.Err
+			return true, data, result.Err
 		}
 
-		return false, nil
+		return false, nil, nil
 	}
 
 	// Start the binary search for the lowest possible gas price
 	for lowEnd < highEnd {
-		mid := (lowEnd + highEnd) / 2
+		mid := lowEnd + ((highEnd - lowEnd) >> 1) // (lowEnd + highEnd) / 2 can overflow
 
-		failed, testErr := testTransaction(mid, true)
-		if testErr != nil &&
-			!isEVMRevertError(testErr) {
+		failed, retVal, testErr := testTransaction(mid, true)
+		if testErr != nil && !isEVMRevertError(testErr) {
 			// Reverts are ignored in the binary search, but are checked later on
 			// during the execution for the optimal gas limit found
-			return 0, testErr
+			return retVal, testErr
 		}
 
 		if failed {
@@ -598,10 +696,10 @@ func (e *Eth) EstimateGas(arg *txnArgs, rawNum *BlockNumber) (interface{}, error
 	}
 
 	// Check if the highEnd is a good value to make the transaction pass
-	failed, err := testTransaction(highEnd, false)
+	failed, retVal, err := testTransaction(highEnd, false)
 	if failed {
 		// The transaction shouldn't fail, for whatever reason, at highEnd
-		return 0, fmt.Errorf(
+		return retVal, fmt.Errorf(
 			"unable to apply transaction even for the highest gas limit %d: %w",
 			highEnd,
 			err,
@@ -655,7 +753,7 @@ func (e *Eth) GetTransactionCount(address types.Address, filter BlockNumberOrHas
 
 	// The filter is empty, use the latest block by default
 	if filter.BlockNumber == nil && filter.BlockHash == nil {
-		filter.BlockNumber, _ = createBlockNumberPointer("latest")
+		filter.BlockNumber, _ = createBlockNumberPointer(latest)
 	}
 
 	if filter.BlockNumber == nil {
@@ -725,4 +823,62 @@ func (e *Eth) UninstallFilter(id string) (bool, error) {
 // Unsubscribe uninstalls a filter in a websocket
 func (e *Eth) Unsubscribe(id string) (bool, error) {
 	return e.filterManager.Uninstall(id), nil
+}
+
+// MaxPriorityFeePerGas calculates the priority fee needed for transaction to be included in a block
+func (e *Eth) MaxPriorityFeePerGas() (interface{}, error) {
+	priorityFee, err := e.store.MaxPriorityFeePerGas()
+	if err != nil {
+		return nil, err
+	}
+
+	return argBigPtr(priorityFee), nil
+}
+
+func (e *Eth) FeeHistory(blockCount argUint64, newestBlock BlockNumber,
+	rewardPercentiles []float64) (interface{}, error) {
+	block, err := GetNumericBlockNumber(newestBlock, e.store)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse newest block argument. Error: %w", err)
+	}
+
+	// Retrieve oldestBlock, baseFeePerGas, gasUsedRatio, and reward synchronously
+	history, err := e.store.FeeHistory(uint64(blockCount), block, rewardPercentiles)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create channels to receive the processed slices asynchronously
+	baseFeePerGasCh := make(chan []argUint64)
+	gasUsedRatioCh := make(chan []float64)
+	rewardCh := make(chan [][]argUint64)
+
+	// Process baseFeePerGas asynchronously
+	go func() {
+		baseFeePerGasCh <- convertToArgUint64Slice(history.BaseFeePerGas)
+	}()
+
+	// Process gasUsedRatio asynchronously
+	go func() {
+		gasUsedRatioCh <- history.GasUsedRatio
+	}()
+
+	// Process reward asynchronously
+	go func() {
+		rewardCh <- convertToArgUint64SliceSlice(history.Reward)
+	}()
+
+	// Wait for the processed slices from goroutines
+	baseFeePerGasResult := <-baseFeePerGasCh
+	gasUsedRatioResult := <-gasUsedRatioCh
+	rewardResult := <-rewardCh
+
+	result := &feeHistoryResult{
+		OldestBlock:   *argUintPtr(history.OldestBlock),
+		BaseFeePerGas: baseFeePerGasResult,
+		GasUsedRatio:  gasUsedRatioResult,
+		Reward:        rewardResult,
+	}
+
+	return result, nil
 }

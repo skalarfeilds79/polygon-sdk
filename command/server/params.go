@@ -33,7 +33,6 @@ const (
 	blockGasTargetFlag           = "block-gas-target"
 	secretsConfigFlag            = "secrets-config"
 	restoreFlag                  = "restore"
-	blockTimeFlag                = "block-time"
 	devIntervalFlag              = "dev-interval"
 	devFlag                      = "dev"
 	corsOriginFlag               = "access-control-allow-origins"
@@ -41,6 +40,11 @@ const (
 
 	relayerFlag               = "relayer"
 	numBlockConfirmationsFlag = "num-block-confirmations"
+
+	concurrentRequestsDebugFlag = "concurrent-requests-debug"
+	webSocketReadLimitFlag      = "websocket-read-limit"
+
+	metricsIntervalFlag = "metrics-interval"
 )
 
 // Flags that are deprecated, but need to be preserved for
@@ -81,8 +85,6 @@ type serverParams struct {
 	blockGasTarget uint64
 	devInterval    uint64
 	isDevMode      bool
-
-	corsAllowedOrigins []string
 
 	ibftBaseTimeoutLegacy uint64
 
@@ -152,9 +154,11 @@ func (p *serverParams) generateConfig() *server.Config {
 		Chain: p.genesisConfig,
 		JSONRPC: &server.JSONRPC{
 			JSONRPCAddr:              p.jsonRPCAddress,
-			AccessControlAllowOrigin: p.corsAllowedOrigins,
+			AccessControlAllowOrigin: p.rawConfig.CorsAllowedOrigins,
 			BatchLengthLimit:         p.rawConfig.JSONRPCBatchRequestLimit,
 			BlockRangeLimit:          p.rawConfig.JSONRPCBlockRangeLimit,
+			ConcurrentRequestsDebug:  p.rawConfig.ConcurrentRequestsDebug,
+			WebSocketReadLimit:       p.rawConfig.WebSocketReadLimit,
 		},
 		GRPCAddr:   p.grpcAddress,
 		LibP2PAddr: p.libp2pAddress,
@@ -179,12 +183,12 @@ func (p *serverParams) generateConfig() *server.Config {
 		MaxAccountEnqueued: p.rawConfig.TxPool.MaxAccountEnqueued,
 		SecretsManager:     p.secretsConfig,
 		RestoreFile:        p.getRestoreFilePath(),
-		BlockTime:          p.rawConfig.BlockTime,
 		LogLevel:           hclog.LevelFromString(p.rawConfig.LogLevel),
 		JSONLogFormat:      p.rawConfig.JSONLogFormat,
 		LogFilePath:        p.logFileLocation,
 
 		Relayer:               p.relayer,
 		NumBlockConfirmations: p.rawConfig.NumBlockConfirmations,
+		MetricsInterval:       p.rawConfig.MetricsInterval,
 	}
 }

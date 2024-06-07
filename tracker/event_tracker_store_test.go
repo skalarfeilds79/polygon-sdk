@@ -2,7 +2,6 @@ package tracker
 
 import (
 	"encoding/hex"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,7 +18,7 @@ func createSetupDB(subscriber eventSubscription, numBlockConfirmations uint64) s
 	return func(t *testing.T) (store.Store, func()) {
 		t.Helper()
 
-		dir, err := ioutil.TempDir("/tmp", "boltdb-test")
+		dir, err := os.MkdirTemp("/tmp", "boltdb-test")
 		require.NoError(t, err)
 
 		path := filepath.Join(dir, "test.db")
@@ -35,14 +34,10 @@ func createSetupDB(subscriber eventSubscription, numBlockConfirmations uint64) s
 }
 
 func TestBoltDBStore(t *testing.T) {
-	t.Parallel()
-
 	store.TestStore(t, createSetupDB(nil, 2))
 }
 
 func TestEntry_getFinalizedLogs(t *testing.T) {
-	t.Parallel()
-
 	const someFilterHash = "test"
 
 	tstore, closeFn := createSetupDB(nil, 3)(t)
@@ -90,8 +85,6 @@ func TestEntry_saveNextToProcessIndx(t *testing.T) {
 }
 
 func TestEventTrackerStore_SetNotLastBlock(t *testing.T) {
-	t.Parallel()
-
 	subs := &mockEventSubscriber{}
 
 	tstore, closeFn := createSetupDB(subs, 2)(t)
@@ -102,8 +95,6 @@ func TestEventTrackerStore_SetNotLastBlock(t *testing.T) {
 }
 
 func TestEventTrackerStore_onNewBlockBad(t *testing.T) {
-	t.Parallel()
-
 	tstore, closeFn := createSetupDB(nil, 0)(t)
 	defer closeFn()
 
@@ -112,8 +103,6 @@ func TestEventTrackerStore_onNewBlockBad(t *testing.T) {
 }
 
 func TestEventTrackerStore_OnNewBlockNothingToProcess(t *testing.T) {
-	t.Parallel()
-
 	subs := &mockEventSubscriber{}
 
 	tstore, closeFn := createSetupDB(subs, 10)(t)
@@ -143,8 +132,6 @@ func TestEventTrackerStore_OnNewBlockNothingToProcess(t *testing.T) {
 }
 
 func TestEventTrackerStore_SetLastBlockSubscriberNotified(t *testing.T) {
-	t.Parallel()
-
 	const hash = "dummy_hash"
 
 	subs := &mockEventSubscriber{}

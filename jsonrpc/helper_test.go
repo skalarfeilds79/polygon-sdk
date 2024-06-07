@@ -1,6 +1,7 @@
 package jsonrpc
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -11,19 +12,63 @@ import (
 )
 
 func createTestTransaction(hash types.Hash) *types.Transaction {
+	recipient := types.StringToAddress("2")
+
 	return &types.Transaction{
-		Hash: hash,
+		Hash:     hash,
+		From:     types.StringToAddress("1"),
+		To:       &recipient,
+		GasPrice: big.NewInt(400),
+		Value:    big.NewInt(100),
+		V:        big.NewInt(1),
+		R:        big.NewInt(2),
+		S:        big.NewInt(3),
 	}
 }
 
-func createTestHeader(height uint64) *types.Header {
+func createTestHeader(height uint64, setterFn func(h *types.Header)) *types.Header {
 	h := &types.Header{
 		Number: height,
+	}
+
+	if setterFn != nil {
+		setterFn(h)
 	}
 
 	h.ComputeHash()
 
 	return h
+}
+
+func createTestReceipt(logs []*types.Log, cumulativeGasUsed, gasUsed uint64, txHash types.Hash) *types.Receipt {
+	success := types.ReceiptSuccess
+
+	return &types.Receipt{
+		Root:              types.ZeroHash,
+		CumulativeGasUsed: cumulativeGasUsed,
+		Status:            &success,
+		LogsBloom:         types.CreateBloom(nil),
+		Logs:              logs,
+		GasUsed:           gasUsed,
+		TxHash:            txHash,
+		TransactionType:   types.DynamicFeeTx,
+	}
+}
+
+func createTestLogs(logsCount int, address types.Address) []*types.Log {
+	logs := make([]*types.Log, 0, logsCount)
+	for i := 0; i < logsCount; i++ {
+		logs = append(logs, &types.Log{
+			Address: address,
+			Topics: []types.Hash{
+				types.StringToHash("100"),
+				types.StringToHash("ABCD"),
+			},
+			Data: types.StringToBytes(hex.EncodeToString([]byte("Lorem Ipsum Dolor"))),
+		})
+	}
+
+	return logs
 }
 
 func wrapHeaderWithTestBlock(h *types.Header) *types.Block {
@@ -36,13 +81,13 @@ var (
 	testTxHash1 = types.BytesToHash([]byte{1})
 	testTx1     = createTestTransaction(testTxHash1)
 
-	testGenesisHeader = createTestHeader(0)
+	testGenesisHeader = createTestHeader(0, nil)
 	testGenesisBlock  = wrapHeaderWithTestBlock(testGenesisHeader)
 
-	testLatestHeader = createTestHeader(100)
+	testLatestHeader = createTestHeader(100, nil)
 	testLatestBlock  = wrapHeaderWithTestBlock(testLatestHeader)
 
-	testHeader10 = createTestHeader(10)
+	testHeader10 = createTestHeader(10, nil)
 	testBlock10  = wrapHeaderWithTestBlock(testHeader10)
 
 	testHash11 = types.BytesToHash([]byte{11})
@@ -630,6 +675,8 @@ func TestDecodeTxn(t *testing.T) {
 		to         = types.StringToAddress("2")
 		gas        = argUint64(uint64(1))
 		gasPrice   = argBytes(new(big.Int).SetUint64(2).Bytes())
+		gasTipCap  = argBytes(new(big.Int).SetUint64(2).Bytes())
+		gasFeeCap  = argBytes(new(big.Int).SetUint64(2).Bytes())
 		value      = argBytes(new(big.Int).SetUint64(4).Bytes())
 		data       = argBytes(new(big.Int).SetUint64(8).Bytes())
 		input      = argBytes(new(big.Int).SetUint64(16).Bytes())
@@ -649,23 +696,27 @@ func TestDecodeTxn(t *testing.T) {
 		{
 			name: "should return mapped transaction",
 			arg: &txnArgs{
-				From:     &from,
-				To:       &to,
-				Gas:      &gas,
-				GasPrice: &gasPrice,
-				Value:    &value,
-				Input:    &input,
-				Nonce:    &nonce,
+				From:      &from,
+				To:        &to,
+				Gas:       &gas,
+				GasPrice:  &gasPrice,
+				GasTipCap: &gasTipCap,
+				GasFeeCap: &gasFeeCap,
+				Value:     &value,
+				Input:     &input,
+				Nonce:     &nonce,
 			},
 			store: &debugEndpointMockStore{},
 			expected: &types.Transaction{
-				From:     from,
-				To:       &to,
-				Gas:      uint64(gas),
-				GasPrice: new(big.Int).SetBytes([]byte(gasPrice)),
-				Value:    new(big.Int).SetBytes([]byte(value)),
-				Input:    input,
-				Nonce:    uint64(nonce),
+				From:      from,
+				To:        &to,
+				Gas:       uint64(gas),
+				GasPrice:  new(big.Int).SetBytes([]byte(gasPrice)),
+				GasTipCap: new(big.Int).SetBytes([]byte(gasTipCap)),
+				GasFeeCap: new(big.Int).SetBytes([]byte(gasFeeCap)),
+				Value:     new(big.Int).SetBytes([]byte(value)),
+				Input:     input,
+				Nonce:     uint64(nonce),
 			},
 			err: false,
 		},
@@ -681,13 +732,15 @@ func TestDecodeTxn(t *testing.T) {
 			},
 			store: &debugEndpointMockStore{},
 			expected: &types.Transaction{
-				From:     types.ZeroAddress,
-				To:       &to,
-				Gas:      uint64(gas),
-				GasPrice: new(big.Int).SetBytes([]byte(gasPrice)),
-				Value:    new(big.Int).SetBytes([]byte(value)),
-				Input:    input,
-				Nonce:    uint64(0),
+				From:      types.ZeroAddress,
+				To:        &to,
+				Gas:       uint64(gas),
+				GasPrice:  new(big.Int).SetBytes([]byte(gasPrice)),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     new(big.Int).SetBytes([]byte(value)),
+				Input:     input,
+				Nonce:     uint64(0),
 			},
 			err: false,
 		},
@@ -714,13 +767,15 @@ func TestDecodeTxn(t *testing.T) {
 				},
 			},
 			expected: &types.Transaction{
-				From:     from,
-				To:       &to,
-				Gas:      uint64(gas),
-				GasPrice: new(big.Int).SetBytes([]byte(gasPrice)),
-				Value:    new(big.Int).SetBytes([]byte(value)),
-				Input:    input,
-				Nonce:    uint64(stateNonce),
+				From:      from,
+				To:        &to,
+				Gas:       uint64(gas),
+				GasPrice:  new(big.Int).SetBytes([]byte(gasPrice)),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     new(big.Int).SetBytes([]byte(value)),
+				Input:     input,
+				Nonce:     uint64(stateNonce),
 			},
 			err: false,
 		},
@@ -738,13 +793,15 @@ func TestDecodeTxn(t *testing.T) {
 			},
 			store: &debugEndpointMockStore{},
 			expected: &types.Transaction{
-				From:     from,
-				To:       &to,
-				Gas:      uint64(gas),
-				GasPrice: new(big.Int).SetBytes([]byte(gasPrice)),
-				Value:    new(big.Int).SetBytes([]byte(value)),
-				Input:    data,
-				Nonce:    uint64(nonce),
+				From:      from,
+				To:        &to,
+				Gas:       uint64(gas),
+				GasPrice:  new(big.Int).SetBytes([]byte(gasPrice)),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     new(big.Int).SetBytes([]byte(value)),
+				Input:     data,
+				Nonce:     uint64(nonce),
 			},
 			err: false,
 		},
@@ -757,13 +814,15 @@ func TestDecodeTxn(t *testing.T) {
 			},
 			store: &debugEndpointMockStore{},
 			expected: &types.Transaction{
-				From:     from,
-				To:       &to,
-				Gas:      uint64(0),
-				GasPrice: new(big.Int),
-				Value:    new(big.Int),
-				Input:    []byte{},
-				Nonce:    uint64(nonce),
+				From:      from,
+				To:        &to,
+				Gas:       uint64(0),
+				GasPrice:  new(big.Int),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     new(big.Int),
+				Input:     []byte{},
+				Nonce:     uint64(nonce),
 			},
 			err: false,
 		},
@@ -811,11 +870,11 @@ func TestDecodeTxn(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			tx, err := DecodeTxn(test.arg, test.store)
+			tx, err := DecodeTxn(test.arg, 1, test.store, false)
 
 			// DecodeTxn computes hash of tx
 			if !test.err {
-				test.expected.ComputeHash()
+				test.expected.ComputeHash(1)
 			}
 
 			assert.Equal(t, test.expected, tx)

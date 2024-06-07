@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/validator"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/assert"
@@ -21,9 +22,9 @@ func TestValidatorsSnapshotCache_GetSnapshot_Build(t *testing.T) {
 		epochSize        = uint64(10)
 	)
 
-	allValidators := newTestValidators(t, totalValidators).getPublicIdentities()
+	allValidators := validator.NewTestValidators(t, totalValidators).GetPublicIdentities()
 
-	var oddValidators, evenValidators AccountSet
+	var oddValidators, evenValidators validator.AccountSet
 
 	for i := 0; i < totalValidators; i++ {
 		if i%2 == 0 {
@@ -42,7 +43,7 @@ func TestValidatorsSnapshotCache_GetSnapshot_Build(t *testing.T) {
 
 	var cases = []struct {
 		blockNumber       uint64
-		expectedSnapshot  AccountSet
+		expectedSnapshot  validator.AccountSet
 		validatorsOverlap bool
 		parents           []*types.Header
 	}{
@@ -65,7 +66,7 @@ func TestValidatorsSnapshotCache_GetSnapshot_Build(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		snapshot, err := testValidatorsCache.GetSnapshot(c.blockNumber, c.parents)
+		snapshot, err := testValidatorsCache.GetSnapshot(c.blockNumber, c.parents, nil)
 
 		assertions.NoError(err)
 		assertions.Len(snapshot, c.expectedSnapshot.Len())
@@ -98,8 +99,8 @@ func TestValidatorsSnapshotCache_GetSnapshot_FetchFromCache(t *testing.T) {
 		validatorSetSize = 5
 	)
 
-	allValidators := newTestValidators(t, totalValidators).getPublicIdentities()
-	epochOneValidators := AccountSet{allValidators[0], allValidators[len(allValidators)-1]}
+	allValidators := validator.NewTestValidators(t, totalValidators).GetPublicIdentities()
+	epochOneValidators := validator.AccountSet{allValidators[0], allValidators[len(allValidators)-1]}
 	epochTwoValidators := allValidators[1 : len(allValidators)-2]
 
 	headersMap := &testHeadersMap{headersByNumber: make(map[uint64]*types.Header)}
@@ -114,11 +115,11 @@ func TestValidatorsSnapshotCache_GetSnapshot_FetchFromCache(t *testing.T) {
 		validatorsSnapshotCache: newValidatorsSnapshotCache(hclog.NewNullLogger(), newTestState(t), blockchainMock),
 	}
 
-	require.NoError(testValidatorsCache.storeSnapshot(&validatorSnapshot{1, 10, epochOneValidators}))
-	require.NoError(testValidatorsCache.storeSnapshot(&validatorSnapshot{2, 20, epochTwoValidators}))
+	require.NoError(testValidatorsCache.storeSnapshot(&validatorSnapshot{1, 10, epochOneValidators}, nil))
+	require.NoError(testValidatorsCache.storeSnapshot(&validatorSnapshot{2, 20, epochTwoValidators}, nil))
 
 	// Fetch snapshot from in memory cache
-	snapshot, err := testValidatorsCache.GetSnapshot(10, nil)
+	snapshot, err := testValidatorsCache.GetSnapshot(10, nil, nil)
 	require.NoError(err)
 	require.Equal(epochOneValidators, snapshot)
 
@@ -126,11 +127,11 @@ func TestValidatorsSnapshotCache_GetSnapshot_FetchFromCache(t *testing.T) {
 	testValidatorsCache.snapshots = map[uint64]*validatorSnapshot{}
 	require.NoError(testValidatorsCache.state.EpochStore.removeAllValidatorSnapshots())
 	// Fetch snapshot from database
-	snapshot, err = testValidatorsCache.GetSnapshot(10, nil)
+	snapshot, err = testValidatorsCache.GetSnapshot(10, nil, nil)
 	require.NoError(err)
 	require.Equal(epochOneValidators, snapshot)
 
-	snapshot, err = testValidatorsCache.GetSnapshot(20, nil)
+	snapshot, err = testValidatorsCache.GetSnapshot(20, nil, nil)
 	require.NoError(err)
 	require.Equal(epochTwoValidators, snapshot)
 }
@@ -143,15 +144,15 @@ func TestValidatorsSnapshotCache_Cleanup(t *testing.T) {
 	cache := &testValidatorsCache{
 		validatorsSnapshotCache: newValidatorsSnapshotCache(hclog.NewNullLogger(), newTestState(t), blockchainMock),
 	}
-	snapshot := newTestValidators(t, 3).getPublicIdentities()
+	snapshot := validator.NewTestValidators(t, 3).GetPublicIdentities()
 	maxEpoch := uint64(0)
 
 	for i := uint64(0); i < validatorSnapshotLimit; i++ {
-		require.NoError(cache.storeSnapshot(&validatorSnapshot{i, i * 10, snapshot}))
+		require.NoError(cache.storeSnapshot(&validatorSnapshot{i, i * 10, snapshot}, nil))
 		maxEpoch++
 	}
 
-	require.NoError(cache.cleanup())
+	require.NoError(cache.cleanup(nil))
 
 	// assertions for remaining snapshots in the in memory cache
 	require.Len(cache.snapshots, numberOfSnapshotsToLeaveInMemory)
@@ -191,7 +192,7 @@ func TestValidatorsSnapshotCache_ComputeSnapshot_UnknownBlock(t *testing.T) {
 		epochSize        = uint64(10)
 	)
 
-	allValidators := newTestValidators(t, totalValidators).getPublicIdentities()
+	allValidators := validator.NewTestValidators(t, totalValidators).GetPublicIdentities()
 	headersMap := &testHeadersMap{}
 	headersMap.addHeader(createValidatorDeltaHeader(t, 0, 0, nil, allValidators[:validatorSetSize]))
 	headersMap.addHeader(createValidatorDeltaHeader(t, 1*epochSize, 1, allValidators[:validatorSetSize], allValidators[validatorSetSize:]))
@@ -218,7 +219,7 @@ func TestValidatorsSnapshotCache_ComputeSnapshot_IncorrectExtra(t *testing.T) {
 		epochSize        = uint64(10)
 	)
 
-	allValidators := newTestValidators(t, totalValidators).getPublicIdentities()
+	allValidators := validator.NewTestValidators(t, totalValidators).GetPublicIdentities()
 	headersMap := &testHeadersMap{}
 	invalidHeader := createValidatorDeltaHeader(t, 1*epochSize, 1, allValidators[:validatorSetSize], allValidators[validatorSetSize:])
 	invalidHeader.ExtraData = []byte{0x2, 0x7}
@@ -246,7 +247,7 @@ func TestValidatorsSnapshotCache_ComputeSnapshot_ApplyDeltaFail(t *testing.T) {
 		epochSize        = uint64(10)
 	)
 
-	allValidators := newTestValidators(t, totalValidators).getPublicIdentities()
+	allValidators := validator.NewTestValidators(t, totalValidators).GetPublicIdentities()
 	headersMap := &testHeadersMap{}
 	headersMap.addHeader(createValidatorDeltaHeader(t, 0, 0, nil, allValidators[:validatorSetSize]))
 	headersMap.addHeader(createValidatorDeltaHeader(t, 1*epochSize, 1, nil, allValidators[:validatorSetSize]))
@@ -263,8 +264,26 @@ func TestValidatorsSnapshotCache_ComputeSnapshot_ApplyDeltaFail(t *testing.T) {
 	assertions.ErrorContains(err, "failed to apply delta to the validators snapshot, block#10")
 }
 
+func TestValidatorsSnapshotCache_Empty(t *testing.T) {
+	t.Parallel()
+
+	headersMap := &testHeadersMap{headersByNumber: make(map[uint64]*types.Header)}
+
+	createHeaders(t, headersMap, 0, 1, 1, nil, nil)
+
+	blockchainMock := new(blockchainMock)
+	blockchainMock.On("GetHeaderByNumber", mock.Anything).Return(headersMap.getHeader)
+
+	testValidatorsCache := &testValidatorsCache{
+		validatorsSnapshotCache: newValidatorsSnapshotCache(hclog.NewNullLogger(), newTestState(t), blockchainMock),
+	}
+
+	_, err := testValidatorsCache.GetSnapshot(1, nil, nil)
+	assert.ErrorContains(t, err, "validator snapshot is empty for block")
+}
+
 func createHeaders(t *testing.T, headersMap *testHeadersMap,
-	fromBlock, toBlock, epoch uint64, oldValidators, newValidators AccountSet) {
+	fromBlock, toBlock, epoch uint64, oldValidators, newValidators validator.AccountSet) {
 	t.Helper()
 
 	headersMap.addHeader(createValidatorDeltaHeader(t, fromBlock, epoch-1, oldValidators, newValidators))
@@ -274,15 +293,15 @@ func createHeaders(t *testing.T, headersMap *testHeadersMap,
 	}
 }
 
-func createValidatorDeltaHeader(t *testing.T, blockNumber, epoch uint64, oldValidatorSet, newValidatorSet AccountSet) *types.Header {
+func createValidatorDeltaHeader(t *testing.T, blockNumber, epoch uint64, oldValidatorSet, newValidatorSet validator.AccountSet) *types.Header {
 	t.Helper()
 
-	delta, _ := createValidatorSetDelta(oldValidatorSet, newValidatorSet)
+	delta, _ := validator.CreateValidatorSetDelta(oldValidatorSet, newValidatorSet)
 	extra := &Extra{Validators: delta, Checkpoint: &CheckpointData{EpochNumber: epoch}}
 
 	return &types.Header{
 		Number:    blockNumber,
-		ExtraData: append(make([]byte, ExtraVanity), extra.MarshalRLPTo(nil)...),
+		ExtraData: extra.MarshalRLPTo(nil),
 	}
 }
 

@@ -6,6 +6,7 @@ on:  # yamllint disable-line rule:truthy
       - main
       - develop
   pull_request:
+  workflow_dispatch:
   workflow_call:
     outputs:
       workflow_output:
@@ -18,16 +19,19 @@ jobs:
     env:
       E2E_TESTS: true
       E2E_LOGS: true
-      E2E_TESTS_TYPE: 'integration'
       CI_VERBOSE: true
     outputs:
       e2e_output_failure: ${{ steps.run_e2e_failure.outputs.test_output }}
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
+
       - name: Install Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v4
         with:
-          go-version: 1.18.x
+          go-version: 1.20.x
+          check-latest: true
+          cache-dependency-path: go.sum
 
       - name: Run tests
         run: make test-e2e-polybft

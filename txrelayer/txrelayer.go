@@ -3,23 +3,34 @@ package txrelayer
 import (
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/umbracle/ethgo"
 	"github.com/umbracle/ethgo/jsonrpc"
 	"github.com/umbracle/ethgo/wallet"
 )
 
 const (
-	DefaultGasPrice   = 1879048192 // 0x70000000
-	DefaultGasLimit   = 5242880    // 0x500000
-	DefaultRPCAddress = "http://127.0.0.1:8545"
-	numRetries        = 1000
+	defaultGasPrice            = 1879048192 // 0x70000000
+	DefaultGasLimit            = 5242880    // 0x500000
+	DefaultRPCAddress          = "http://127.0.0.1:8545"
+	defaultNumRetries          = 1000
+	gasLimitIncreasePercentage = 100
+	feeIncreasePercentage      = 100
 )
 
 var (
-	errNoAccounts = errors.New("no accounts registered")
+	errNoAccounts     = errors.New("no accounts registered")
+	errMethodNotFound = errors.New("method not found")
+
+	// dynamicFeeTxFallbackErrs represents known errors which are the reason to fallback
+	// from sending dynamic fee tx to legacy tx
+	dynamicFeeTxFallbackErrs = []error{types.ErrTxTypeNotSupported, errMethodNotFound}
 )
 
 type TxRelayer interface {
@@ -30,6 +41,8 @@ type TxRelayer interface {
 	// SendTransactionLocal sends non-signed transaction
 	// (this function is meant only for testing purposes and is about to be removed at some point)
 	SendTransactionLocal(txn *ethgo.Transaction) (*ethgo.Receipt, error)
+	// Client returns jsonrpc client
+	Client() *jsonrpc.Client
 }
 
 var _ TxRelayer = (*TxRelayerImpl)(nil)
@@ -38,14 +51,18 @@ type TxRelayerImpl struct {
 	ipAddress      string
 	client         *jsonrpc.Client
 	receiptTimeout time.Duration
+	numRetries     int
 
 	lock sync.Mutex
+
+	writer io.Writer
 }
 
 func NewTxRelayer(opts ...TxRelayerOption) (TxRelayer, error) {
 	t := &TxRelayerImpl{
-		ipAddress:      "http://127.0.0.1:8545",
+		ipAddress:      DefaultRPCAddress,
 		receiptTimeout: 50 * time.Millisecond,
+		numRetries:     defaultNumRetries,
 	}
 	for _, opt := range opts {
 		opt(t)
@@ -78,10 +95,29 @@ func (t *TxRelayerImpl) Call(from ethgo.Address, to ethgo.Address, input []byte)
 func (t *TxRelayerImpl) SendTransaction(txn *ethgo.Transaction, key ethgo.Key) (*ethgo.Receipt, error) {
 	txnHash, err := t.sendTransactionLocked(txn, key)
 	if err != nil {
+		if txn.Type != ethgo.TransactionLegacy {
+			for _, fallbackErr := range dynamicFeeTxFallbackErrs {
+				if strings.Contains(
+					strings.ToLower(err.Error()),
+					strings.ToLower(fallbackErr.Error())) {
+					// "downgrade" transaction to the legacy tx type and resend it
+					txn.Type = ethgo.TransactionLegacy
+					txn.GasPrice = 0
+
+					return t.SendTransaction(txn, key)
+				}
+			}
+		}
+
 		return nil, err
 	}
 
 	return t.waitForReceipt(txnHash)
+}
+
+// Client returns jsonrpc client
+func (t *TxRelayerImpl) Client() *jsonrpc.Client {
+	return t.client
 }
 
 func (t *TxRelayerImpl) sendTransactionLocked(txn *ethgo.Transaction, key ethgo.Key) (ethgo.Hash, error) {
@@ -90,22 +126,66 @@ func (t *TxRelayerImpl) sendTransactionLocked(txn *ethgo.Transaction, key ethgo.
 
 	nonce, err := t.client.Eth().GetNonce(key.Address(), ethgo.Pending)
 	if err != nil {
-		return ethgo.ZeroHash, err
-	}
-
-	txn.Nonce = nonce
-
-	if txn.GasPrice == 0 {
-		txn.GasPrice = DefaultGasPrice
-	}
-
-	if txn.Gas == 0 {
-		txn.Gas = DefaultGasLimit
+		return ethgo.ZeroHash, fmt.Errorf("failed to get nonce: %w", err)
 	}
 
 	chainID, err := t.client.Eth().ChainID()
 	if err != nil {
 		return ethgo.ZeroHash, err
+	}
+
+	txn.ChainID = chainID
+	txn.Nonce = nonce
+
+	if txn.From == ethgo.ZeroAddress {
+		txn.From = key.Address()
+	}
+
+	if txn.Type == ethgo.TransactionDynamicFee {
+		maxPriorityFee := txn.MaxPriorityFeePerGas
+		if maxPriorityFee == nil {
+			// retrieve the max priority fee per gas
+			if maxPriorityFee, err = t.Client().Eth().MaxPriorityFeePerGas(); err != nil {
+				return ethgo.ZeroHash, fmt.Errorf("failed to get max priority fee per gas: %w", err)
+			}
+
+			// set retrieved max priority fee per gas increased by certain percentage
+			compMaxPriorityFee := new(big.Int).Mul(maxPriorityFee, big.NewInt(feeIncreasePercentage))
+			compMaxPriorityFee = compMaxPriorityFee.Div(compMaxPriorityFee, big.NewInt(100))
+			txn.MaxPriorityFeePerGas = new(big.Int).Add(maxPriorityFee, compMaxPriorityFee)
+		}
+
+		if txn.MaxFeePerGas == nil {
+			// retrieve the latest base fee
+			feeHist, err := t.Client().Eth().FeeHistory(1, ethgo.Latest, nil)
+			if err != nil {
+				return ethgo.ZeroHash, fmt.Errorf("failed to get fee history: %w", err)
+			}
+
+			baseFee := feeHist.BaseFee[len(feeHist.BaseFee)-1]
+			// set max fee per gas as sum of base fee and max priority fee
+			// (increased by certain percentage)
+			maxFeePerGas := new(big.Int).Add(baseFee, maxPriorityFee)
+			compMaxFeePerGas := new(big.Int).Mul(maxFeePerGas, big.NewInt(feeIncreasePercentage))
+			compMaxFeePerGas = compMaxFeePerGas.Div(compMaxFeePerGas, big.NewInt(100))
+			txn.MaxFeePerGas = new(big.Int).Add(maxFeePerGas, compMaxFeePerGas)
+		}
+	} else if txn.GasPrice == 0 {
+		gasPrice, err := t.Client().Eth().GasPrice()
+		if err != nil {
+			return ethgo.ZeroHash, fmt.Errorf("failed to get gas price: %w", err)
+		}
+
+		txn.GasPrice = gasPrice + (gasPrice * feeIncreasePercentage / 100)
+	}
+
+	if txn.Gas == 0 {
+		gasLimit, err := t.client.Eth().EstimateGas(ConvertTxnToCallMsg(txn))
+		if err != nil {
+			return ethgo.ZeroHash, fmt.Errorf("failed to estimate gas: %w", err)
+		}
+
+		txn.Gas = gasLimit + (gasLimit * gasLimitIncreasePercentage / 100)
 	}
 
 	signer := wallet.NewEIP155Signer(chainID.Uint64())
@@ -118,26 +198,28 @@ func (t *TxRelayerImpl) sendTransactionLocked(txn *ethgo.Transaction, key ethgo.
 		return ethgo.ZeroHash, err
 	}
 
+	if t.writer != nil {
+		var msg string
+
+		if txn.Type == ethgo.TransactionDynamicFee {
+			msg = fmt.Sprintf("[TxRelayer.SendTransaction]\nFrom = %s\nGas = %d\n"+
+				"Max Fee Per Gas = %d\nMax Priority Fee Per Gas = %d\n",
+				txn.From, txn.Gas, txn.MaxFeePerGas, txn.MaxPriorityFeePerGas)
+		} else {
+			msg = fmt.Sprintf("[TxRelayer.SendTransaction]\nFrom = %s\nGas = %d\nGas Price = %d\n",
+				txn.From, txn.Gas, txn.GasPrice)
+		}
+
+		_, _ = t.writer.Write([]byte(msg))
+	}
+
 	return t.client.Eth().SendRawTransaction(data)
 }
 
 // SendTransactionLocal sends non-signed transaction
 // (this function is meant only for testing purposes and is about to be removed at some point)
 func (t *TxRelayerImpl) SendTransactionLocal(txn *ethgo.Transaction) (*ethgo.Receipt, error) {
-	accounts, err := t.client.Eth().Accounts()
-	if err != nil {
-		return nil, err
-	}
-
-	if len(accounts) == 0 {
-		return nil, errNoAccounts
-	}
-
-	txn.From = accounts[0]
-	txn.Gas = DefaultGasLimit
-	txn.GasPrice = DefaultGasPrice
-
-	txnHash, err := t.client.Eth().SendTransaction(txn)
+	txnHash, err := t.sendTransactionLocalLocked(txn)
 	if err != nil {
 		return nil, err
 	}
@@ -145,10 +227,39 @@ func (t *TxRelayerImpl) SendTransactionLocal(txn *ethgo.Transaction) (*ethgo.Rec
 	return t.waitForReceipt(txnHash)
 }
 
-func (t *TxRelayerImpl) waitForReceipt(hash ethgo.Hash) (*ethgo.Receipt, error) {
-	count := uint(0)
+func (t *TxRelayerImpl) sendTransactionLocalLocked(txn *ethgo.Transaction) (ethgo.Hash, error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 
-	for {
+	accounts, err := t.client.Eth().Accounts()
+	if err != nil {
+		return ethgo.ZeroHash, err
+	}
+
+	if len(accounts) == 0 {
+		return ethgo.ZeroHash, errNoAccounts
+	}
+
+	txn.From = accounts[0]
+
+	gasLimit, err := t.client.Eth().EstimateGas(ConvertTxnToCallMsg(txn))
+	if err != nil {
+		return ethgo.ZeroHash, err
+	}
+
+	txn.Gas = gasLimit
+	txn.GasPrice = defaultGasPrice
+
+	return t.client.Eth().SendTransaction(txn)
+}
+
+func (t *TxRelayerImpl) waitForReceipt(hash ethgo.Hash) (*ethgo.Receipt, error) {
+	// A negative numRetries means we don't want to receive the receipt after SendTransaction/SendTransactionLocal calls
+	if t.numRetries < 0 {
+		return nil, nil
+	}
+
+	for count := 0; count < t.numRetries; count++ {
 		receipt, err := t.client.Eth().GetTransactionReceipt(hash)
 		if err != nil {
 			if err.Error() != "not found" {
@@ -160,12 +271,21 @@ func (t *TxRelayerImpl) waitForReceipt(hash ethgo.Hash) (*ethgo.Receipt, error) 
 			return receipt, nil
 		}
 
-		if count > numRetries {
-			return nil, fmt.Errorf("timeout while waiting for transaction %s to be processed", hash)
-		}
-
 		time.Sleep(t.receiptTimeout)
-		count++
+	}
+
+	return nil, fmt.Errorf("timeout while waiting for transaction %s to be processed", hash)
+}
+
+// ConvertTxnToCallMsg converts txn instance to call message
+func ConvertTxnToCallMsg(txn *ethgo.Transaction) *ethgo.CallMsg {
+	return &ethgo.CallMsg{
+		From:     txn.From,
+		To:       txn.To,
+		Data:     txn.Input,
+		GasPrice: txn.GasPrice,
+		Value:    txn.Value,
+		Gas:      new(big.Int).SetUint64(txn.Gas),
 	}
 }
 
@@ -186,5 +306,20 @@ func WithIPAddress(ipAddress string) TxRelayerOption {
 func WithReceiptTimeout(receiptTimeout time.Duration) TxRelayerOption {
 	return func(t *TxRelayerImpl) {
 		t.receiptTimeout = receiptTimeout
+	}
+}
+
+func WithWriter(writer io.Writer) TxRelayerOption {
+	return func(t *TxRelayerImpl) {
+		t.writer = writer
+	}
+}
+
+// WithNumRetries sets the maximum number of eth_getTransactionReceipt retries
+// before considering the transaction sending as timed out. Set to -1 to disable
+// waitForReceipt and not wait for the transaction receipt
+func WithNumRetries(numRetries int) TxRelayerOption {
+	return func(t *TxRelayerImpl) {
+		t.numRetries = numRetries
 	}
 }

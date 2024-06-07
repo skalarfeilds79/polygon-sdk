@@ -8,6 +8,7 @@ import (
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEth_DecodeTxn(t *testing.T) {
@@ -35,22 +36,26 @@ func TestEth_DecodeTxn(t *testing.T) {
 		{
 			name: "should be successful",
 			arg: &txnArgs{
-				From:     &addr1,
-				To:       &addr2,
-				Gas:      toArgUint64Ptr(21000),
-				GasPrice: toArgBytesPtr(big.NewInt(10000).Bytes()),
-				Value:    toArgBytesPtr(oneEther.Bytes()),
-				Data:     nil,
-				Nonce:    toArgUint64Ptr(0),
+				From:      &addr1,
+				To:        &addr2,
+				Gas:       toArgUint64Ptr(21000),
+				GasPrice:  toArgBytesPtr(big.NewInt(10000).Bytes()),
+				GasTipCap: toArgBytesPtr(big.NewInt(10000).Bytes()),
+				GasFeeCap: toArgBytesPtr(big.NewInt(10000).Bytes()),
+				Value:     toArgBytesPtr(oneEther.Bytes()),
+				Data:      nil,
+				Nonce:     toArgUint64Ptr(0),
 			},
 			res: &types.Transaction{
-				From:     addr1,
-				To:       &addr2,
-				Gas:      21000,
-				GasPrice: big.NewInt(10000),
-				Value:    oneEther,
-				Input:    []byte{},
-				Nonce:    0,
+				From:      addr1,
+				To:        &addr2,
+				Gas:       21000,
+				GasPrice:  big.NewInt(10000),
+				GasTipCap: big.NewInt(10000),
+				GasFeeCap: big.NewInt(10000),
+				Value:     oneEther,
+				Input:     []byte{},
+				Nonce:     0,
 			},
 			err: nil,
 		},
@@ -64,13 +69,15 @@ func TestEth_DecodeTxn(t *testing.T) {
 				Data:     nil,
 			},
 			res: &types.Transaction{
-				From:     types.ZeroAddress,
-				To:       &addr2,
-				Gas:      21000,
-				GasPrice: big.NewInt(10000),
-				Value:    oneEther,
-				Input:    []byte{},
-				Nonce:    0,
+				From:      types.ZeroAddress,
+				To:        &addr2,
+				Gas:       21000,
+				GasPrice:  big.NewInt(10000),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     oneEther,
+				Input:     []byte{},
+				Nonce:     0,
 			},
 			err: nil,
 		},
@@ -90,13 +97,15 @@ func TestEth_DecodeTxn(t *testing.T) {
 				Data:     nil,
 			},
 			res: &types.Transaction{
-				From:     addr1,
-				To:       &addr2,
-				Gas:      21000,
-				GasPrice: big.NewInt(10000),
-				Value:    oneEther,
-				Input:    []byte{},
-				Nonce:    10,
+				From:      addr1,
+				To:        &addr2,
+				Gas:       21000,
+				GasPrice:  big.NewInt(10000),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     oneEther,
+				Input:     []byte{},
+				Nonce:     10,
 			},
 			err: nil,
 		},
@@ -111,13 +120,15 @@ func TestEth_DecodeTxn(t *testing.T) {
 				Nonce:    toArgUint64Ptr(1),
 			},
 			res: &types.Transaction{
-				From:     addr1,
-				To:       &addr2,
-				Gas:      21000,
-				GasPrice: big.NewInt(10000),
-				Value:    new(big.Int).SetBytes([]byte{}),
-				Input:    []byte{},
-				Nonce:    1,
+				From:      addr1,
+				To:        &addr2,
+				Gas:       21000,
+				GasPrice:  big.NewInt(10000),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     new(big.Int).SetBytes([]byte{}),
+				Input:     []byte{},
+				Nonce:     1,
 			},
 			err: nil,
 		},
@@ -131,13 +142,15 @@ func TestEth_DecodeTxn(t *testing.T) {
 				Nonce:    toArgUint64Ptr(1),
 			},
 			res: &types.Transaction{
-				From:     addr1,
-				To:       &addr2,
-				Gas:      0,
-				GasPrice: big.NewInt(10000),
-				Value:    new(big.Int).SetBytes([]byte{}),
-				Input:    []byte{},
-				Nonce:    1,
+				From:      addr1,
+				To:        &addr2,
+				Gas:       0,
+				GasPrice:  big.NewInt(10000),
+				GasTipCap: new(big.Int),
+				GasFeeCap: new(big.Int),
+				Value:     new(big.Int).SetBytes([]byte{}),
+				Input:     []byte{},
+				Nonce:     1,
 			},
 			err: nil,
 		},
@@ -149,14 +162,15 @@ func TestEth_DecodeTxn(t *testing.T) {
 			t.Parallel()
 
 			if tt.res != nil {
-				tt.res.ComputeHash()
+				tt.res.ComputeHash(1)
 			}
+
 			store := newMockStore()
 			for addr, acc := range tt.accounts {
 				store.SetAccount(addr, acc)
 			}
 
-			res, err := DecodeTxn(tt.arg, store)
+			res, err := DecodeTxn(tt.arg, 1, store, false)
 			assert.Equal(t, tt.res, res)
 			assert.Equal(t, tt.err, err)
 		})
@@ -230,6 +244,59 @@ func TestEth_GetNextNonce(t *testing.T) {
 	}
 }
 
+func TestEth_TxnType(t *testing.T) {
+	// Set up the mock accounts
+	accounts := []struct {
+		address types.Address
+		account *Account
+	}{
+		{
+			types.StringToAddress("123"),
+			&Account{
+				Nonce: 5,
+			},
+		},
+	}
+
+	// Set up the mock store
+	store := newMockStore()
+	for _, acc := range accounts {
+		store.SetAccount(acc.address, acc.account)
+	}
+
+	// Setup Txn
+	args := &txnArgs{
+		From:      &addr1,
+		To:        &addr2,
+		Gas:       toArgUint64Ptr(21000),
+		GasPrice:  toArgBytesPtr(big.NewInt(10000).Bytes()),
+		GasTipCap: toArgBytesPtr(big.NewInt(10000).Bytes()),
+		GasFeeCap: toArgBytesPtr(big.NewInt(10000).Bytes()),
+		Value:     toArgBytesPtr(oneEther.Bytes()),
+		Data:      nil,
+		Nonce:     toArgUint64Ptr(0),
+		Type:      toArgUint64Ptr(uint64(types.DynamicFeeTx)),
+	}
+
+	expectedRes := &types.Transaction{
+		From:      addr1,
+		To:        &addr2,
+		Gas:       21000,
+		GasPrice:  big.NewInt(10000),
+		GasTipCap: big.NewInt(10000),
+		GasFeeCap: big.NewInt(10000),
+		Value:     oneEther,
+		Input:     []byte{},
+		Nonce:     0,
+		Type:      types.DynamicFeeTx,
+	}
+	res, err := DecodeTxn(args, 1, store, false)
+
+	expectedRes.ComputeHash(1)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedRes, res)
+}
+
 func newTestEthEndpoint(store testStore) *Eth {
 	return &Eth{
 		hclog.NewNullLogger(), store, 100, nil, 0,
@@ -297,4 +364,30 @@ func TestEth_HeaderResolveBlock(t *testing.T) {
 			assert.Equal(t, header.Number, uint64(10))
 		}
 	}
+}
+
+func TestOverrideAccount_ToType(t *testing.T) {
+	t.Parallel()
+
+	nonce := uint64(10)
+	code := []byte("SC code")
+	balance := uint64(10000)
+	state := map[types.Hash]types.Hash{types.StringToHash("1"): types.StringToHash("2")}
+	stateDiff := map[types.Hash]types.Hash{types.StringToHash("3"): types.StringToHash("4")}
+
+	overrideAcc := &overrideAccount{
+		Nonce:     toArgUint64Ptr(nonce),
+		Code:      toArgBytesPtr(code),
+		Balance:   toArgUint64Ptr(balance),
+		State:     &state,
+		StateDiff: &stateDiff,
+	}
+
+	convertedAcc := overrideAcc.ToType()
+	require.NotNil(t, convertedAcc)
+	require.Equal(t, nonce, *convertedAcc.Nonce)
+	require.Equal(t, code, convertedAcc.Code)
+	require.Equal(t, new(big.Int).SetUint64(balance), convertedAcc.Balance)
+	require.Equal(t, state, convertedAcc.State)
+	require.Equal(t, stateDiff, convertedAcc.StateDiff)
 }

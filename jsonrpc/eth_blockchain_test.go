@@ -6,8 +6,11 @@ import (
 	"testing"
 
 	"github.com/0xPolygon/polygon-edge/blockchain"
+	"github.com/0xPolygon/polygon-edge/chain"
+	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/helper/progress"
 	"github.com/0xPolygon/polygon-edge/state/runtime"
+	"github.com/0xPolygon/polygon-edge/txpool/proto"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -95,7 +98,7 @@ func TestEth_Block_GetBlockTransactionCountByNumber(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, res, "expected to return block, but got nil")
-	assert.Equal(t, res, 10)
+	assert.Equal(t, "0xa", res)
 }
 
 func TestEth_GetTransactionByHash(t *testing.T) {
@@ -188,30 +191,58 @@ func TestEth_GetTransactionReceipt(t *testing.T) {
 		eth := newTestEthEndpoint(store)
 		block := newTestBlock(1, hash4)
 		store.add(block)
-		txn := newTestTransaction(uint64(0), addr0)
-		block.Transactions = append(block.Transactions, txn)
-		rec := &types.Receipt{
+		txn0 := newTestTransaction(uint64(0), addr0)
+		txn1 := newTestTransaction(uint64(1), addr1)
+		block.Transactions = []*types.Transaction{txn0, txn1}
+		receipt1 := &types.Receipt{
 			Logs: []*types.Log{
 				{
+					// log 0
+					Topics: []types.Hash{
+						hash1,
+					},
+				},
+				{
+					// log 1
+					Topics: []types.Hash{
+						hash2,
+					},
+				},
+				{
+					// log 2
+					Topics: []types.Hash{
+						hash3,
+					},
+				},
+			},
+		}
+		receipt1.SetStatus(types.ReceiptSuccess)
+		receipt2 := &types.Receipt{
+			Logs: []*types.Log{
+				{
+					// log 3
 					Topics: []types.Hash{
 						hash4,
 					},
 				},
 			},
 		}
-		rec.SetStatus(types.ReceiptSuccess)
-		store.receipts[hash4] = []*types.Receipt{rec}
+		receipt2.SetStatus(types.ReceiptSuccess)
+		store.receipts[hash4] = []*types.Receipt{receipt1, receipt2}
 
-		res, err := eth.GetTransactionReceipt(txn.Hash)
+		res, err := eth.GetTransactionReceipt(txn1.Hash)
 
 		assert.NoError(t, err)
 		assert.NotNil(t, res)
 
 		//nolint:forcetypeassert
 		response := res.(*receipt)
-		assert.Equal(t, txn.Hash, response.TxHash)
+		assert.Equal(t, txn1.Hash, response.TxHash)
 		assert.Equal(t, block.Hash(), response.BlockHash)
 		assert.NotNil(t, response.Logs)
+		assert.Len(t, response.Logs, 1)
+		assert.Equal(t, uint64(3), uint64(response.Logs[0].LogIndex))
+		assert.Equal(t, uint64(1), uint64(response.Logs[0].TxIndex))
 	})
 }
 
@@ -246,42 +277,89 @@ func TestEth_Syncing(t *testing.T) {
 	})
 }
 
-// if price-limit flag is set its value should be returned if it is higher than avg gas price
-func TestEth_GetPrice_PriceLimitSet(t *testing.T) {
-	priceLimit := uint64(100333)
+func TestEth_GasPrice_WithLondonFork(t *testing.T) {
+	const (
+		baseFee    = uint64(10000)
+		tipCap     = uint64(1000)
+		priceLimit = uint64(10010)
+	)
+
 	store := newMockBlockStore()
+	store.blocks = []*types.Block{
+		{
+			Header: &types.Header{Number: uint64(1)},
+		},
+	}
+	store.maxPriorityFeePerGasFn = func() (*big.Int, error) {
+		return new(big.Int).SetUint64(tipCap), nil
+	}
+
 	// not using newTestEthEndpoint as we need to set priceLimit
 	eth := newTestEthEndpointWithPriceLimit(store, priceLimit)
 
-	t.Run("returns price limit flag value when it is larger than average gas price", func(t *testing.T) {
+	t.Run("returns price limit flag value when it is larger than MaxPriorityFee+BaseFee", func(t *testing.T) {
+		store.baseFee = 0
+
 		res, err := eth.GasPrice()
-		store.averageGasPrice = 0
+
 		assert.NoError(t, err)
 		assert.NotNil(t, res)
-
 		assert.Equal(t, argUint64(priceLimit), res)
 	})
 
-	t.Run("returns average gas price when it is larger than set price limit flag", func(t *testing.T) {
-		store.averageGasPrice = 500000
+	t.Run("returns MaxPriorityFee+BaseFee when it is larger than set price limit flag", func(t *testing.T) {
+		store.baseFee = baseFee
+
 		res, err := eth.GasPrice()
+
 		assert.NoError(t, err)
 		assert.NotNil(t, res)
+		assert.Equal(t, argUint64(baseFee+tipCap), res)
+	})
 
-		assert.GreaterOrEqual(t, res, argUint64(priceLimit))
+	t.Run("returns error if MaxPriorityFeePerGas returns error", func(t *testing.T) {
+		store.maxPriorityFeePerGasFn = func() (*big.Int, error) {
+			return nil, runtime.ErrDepth
+		}
+
+		_, err := eth.GasPrice()
+
+		assert.ErrorIs(t, err, runtime.ErrDepth)
 	})
 }
 
-func TestEth_GasPrice(t *testing.T) {
+func TestEth_GasPrice_WithoutLondonFork(t *testing.T) {
+	const priceLimit = 100000
+
 	store := newMockBlockStore()
-	store.averageGasPrice = 9999
-	eth := newTestEthEndpoint(store)
+	store.forksInTime.London = false
+	store.blocks = []*types.Block{
+		{
+			Header: &types.Header{Number: uint64(1)},
+		},
+	}
 
-	res, err := eth.GasPrice()
-	assert.NoError(t, err)
-	assert.NotNil(t, res)
+	eth := newTestEthEndpointWithPriceLimit(store, priceLimit)
 
-	assert.Equal(t, argUint64(store.averageGasPrice), res)
+	t.Run("priceLimit is greater than averageGasPrice", func(t *testing.T) {
+		store.averageGasPrice = priceLimit - 100
+
+		res, err := eth.GasPrice()
+
+		assert.NoError(t, err)
+		assert.NotNil(t, res)
+		assert.Equal(t, argUint64(priceLimit), res)
+	})
+
+	t.Run("averageGasPrice is greater than priceLimit", func(t *testing.T) {
+		store.averageGasPrice = priceLimit + 100
+
+		res, err := eth.GasPrice()
+
+		assert.NoError(t, err)
+		assert.NotNil(t, res)
+		assert.Equal(t, argUint64(priceLimit+100), res)
+	})
 }
 
 func TestEth_Call(t *testing.T) {
@@ -304,7 +382,7 @@ func TestEth_Call(t *testing.T) {
 			Nonce:    argUintPtr(0),
 		}
 
-		res, err := eth.Call(contractCall, BlockNumberOrHash{})
+		res, err := eth.Call(contractCall, BlockNumberOrHash{}, nil)
 
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), store.ethCallError.Error())
@@ -328,10 +406,37 @@ func TestEth_Call(t *testing.T) {
 			Nonce:    argUintPtr(0),
 		}
 
-		res, err := eth.Call(contractCall, BlockNumberOrHash{})
+		res, err := eth.Call(contractCall, BlockNumberOrHash{}, nil)
 
 		assert.NoError(t, err)
 		assert.NotNil(t, res)
+	})
+
+	t.Run("returns error and result as data of a reverted transaction execution", func(t *testing.T) {
+		t.Parallel()
+
+		returnValue := []byte("Reverted()")
+
+		store := newMockBlockStore()
+		store.add(newTestBlock(100, hash1))
+		store.ethCallError = runtime.ErrExecutionReverted
+		store.returnValue = returnValue
+		eth := newTestEthEndpoint(store)
+		contractCall := &txnArgs{
+			From:     &addr0,
+			To:       &addr1,
+			Gas:      argUintPtr(100000),
+			GasPrice: argBytesPtr([]byte{0x64}),
+			Value:    argBytesPtr([]byte{0x64}),
+			Data:     nil,
+			Nonce:    argUintPtr(0),
+		}
+
+		res, err := eth.Call(contractCall, BlockNumberOrHash{}, nil)
+		assert.Error(t, err)
+		assert.NotNil(t, res)
+		bres := res.([]byte) //nolint:forcetypeassert
+		assert.Equal(t, []byte(hex.EncodeToString(returnValue)), bres)
 	})
 }
 
@@ -348,11 +453,17 @@ type mockBlockStore struct {
 	isSyncing       bool
 	averageGasPrice int64
 	ethCallError    error
+	returnValue     []byte
+	forksInTime     chain.ForksInTime
+	baseFee         uint64
+
+	maxPriorityFeePerGasFn func() (*big.Int, error)
 }
 
 func newMockBlockStore() *mockBlockStore {
 	store := &mockBlockStore{}
 	store.receipts = make(map[types.Hash][]*types.Receipt)
+	store.forksInTime = chain.AllForksEnabled.At(0)
 
 	return store
 }
@@ -517,12 +628,43 @@ func (m *mockBlockStore) GetAvgGasPrice() *big.Int {
 	return big.NewInt(m.averageGasPrice)
 }
 
-func (m *mockBlockStore) ApplyTxn(header *types.Header, txn *types.Transaction) (*runtime.ExecutionResult, error) {
-	return &runtime.ExecutionResult{Err: m.ethCallError}, nil
+func (m *mockBlockStore) ApplyTxn(_ *types.Header, _ *types.Transaction, _ types.StateOverride, _ bool) (*runtime.ExecutionResult, error) {
+	return &runtime.ExecutionResult{
+		Err:         m.ethCallError,
+		ReturnValue: m.returnValue,
+	}, nil
 }
 
 func (m *mockBlockStore) SubscribeEvents() blockchain.Subscription {
 	return nil
+}
+
+func (m *mockBlockStore) FilterExtra(extra []byte) ([]byte, error) {
+	return extra, nil
+}
+
+func (m *mockBlockStore) TxPoolSubscribe(request *proto.SubscribeRequest) (<-chan *proto.TxPoolEvent, func(), error) {
+	return nil, nil, nil
+}
+
+func (m *mockBlockStore) GetAccount(root types.Hash, addr types.Address) (*Account, error) {
+	return &Account{Nonce: 0}, nil
+}
+
+func (m *mockBlockStore) GetBaseFee() uint64 {
+	return m.baseFee
+}
+
+func (m *mockBlockStore) GetForksInTime(block uint64) chain.ForksInTime {
+	return m.forksInTime
+}
+
+func (m *mockBlockStore) MaxPriorityFeePerGas() (*big.Int, error) {
+	if m.maxPriorityFeePerGasFn != nil {
+		return m.maxPriorityFeePerGasFn()
+	}
+
+	return big.NewInt(0), nil
 }
 
 func newTestBlock(number uint64, hash types.Hash) *types.Block {

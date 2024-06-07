@@ -38,8 +38,7 @@ type blockchainBackend interface {
 		txPool txPoolInterface, blockTime time.Duration, logger hclog.Logger) (blockBuilder, error)
 
 	// ProcessBlock builds a final block from given 'block' on top of 'parent'.
-	ProcessBlock(parent *types.Header, block *types.Block,
-		callback func(*state.Transition) error) (*types.FullBlock, error)
+	ProcessBlock(parent *types.Header, block *types.Block) (*types.FullBlock, error)
 
 	// GetStateProviderForBlock returns a reference to make queries to the state at 'block'.
 	GetStateProviderForBlock(block *types.Header) (contract.Provider, error)
@@ -56,10 +55,17 @@ type blockchainBackend interface {
 	// GetSystemState creates a new instance of SystemState interface
 	GetSystemState(provider contract.Provider) SystemState
 
+	// SubscribeEvents subscribes to blockchain events
 	SubscribeEvents() blockchain.Subscription
+
+	// UnubscribeEvents unsubscribes from blockchain events
+	UnubscribeEvents(subscription blockchain.Subscription)
 
 	// GetChainID returns chain id of the current blockchain
 	GetChainID() uint64
+
+	// GetReceiptsByHash retrieves receipts by hash
+	GetReceiptsByHash(hash types.Hash) ([]*types.Receipt, error)
 }
 
 var _ blockchainBackend = &blockchainWrapper{}
@@ -76,17 +82,13 @@ func (p *blockchainWrapper) CurrentHeader() *types.Header {
 
 // CommitBlock commits a block to the chain
 func (p *blockchainWrapper) CommitBlock(block *types.FullBlock) error {
-	if err := p.blockchain.WriteFullBlock(block, consensusSource); err != nil {
-		return err
-	}
-
-	return nil
+	return p.blockchain.WriteFullBlock(block, consensusSource)
 }
 
 // ProcessBlock builds a final block from given 'block' on top of 'parent'
-func (p *blockchainWrapper) ProcessBlock(parent *types.Header, block *types.Block,
-	callback func(*state.Transition) error) (*types.FullBlock, error) {
+func (p *blockchainWrapper) ProcessBlock(parent *types.Header, block *types.Block) (*types.FullBlock, error) {
 	header := block.Header.Copy()
+	start := time.Now().UTC()
 
 	transition, err := p.executor.BeginTxn(parent.StateRoot, header, types.BytesToAddress(header.Miner))
 	if err != nil {
@@ -95,18 +97,17 @@ func (p *blockchainWrapper) ProcessBlock(parent *types.Header, block *types.Bloc
 
 	// apply transactions from block
 	for _, tx := range block.Transactions {
-		if err := transition.Write(tx); err != nil {
+		if err = transition.Write(tx); err != nil {
 			return nil, fmt.Errorf("process block tx error, tx = %v, err = %w", tx.Hash, err)
 		}
 	}
 
-	if callback != nil {
-		if err := callback(transition); err != nil {
-			return nil, err
-		}
+	_, root, err := transition.Commit()
+	if err != nil {
+		return nil, fmt.Errorf("failed to commit the state changes: %w", err)
 	}
 
-	_, root := transition.Commit()
+	updateBlockExecutionMetric(start)
 
 	if root != block.Header.StateRoot {
 		return nil, fmt.Errorf("incorrect state root: (%s, %s)", root, block.Header.StateRoot)
@@ -118,6 +119,11 @@ func (p *blockchainWrapper) ProcessBlock(parent *types.Header, block *types.Bloc
 		Txns:     block.Transactions,
 		Receipts: transition.Receipts(),
 	})
+
+	if builtBlock.Header.TxRoot != block.Header.TxRoot {
+		return nil, fmt.Errorf("incorrect tx root (expected: %s, actual: %s)",
+			builtBlock.Header.TxRoot, block.Header.TxRoot)
+	}
 
 	return &types.FullBlock{
 		Block:    builtBlock,
@@ -165,6 +171,7 @@ func (p *blockchainWrapper) NewBlockBuilder(
 		Coinbase:  coinbase,
 		Executor:  p.executor,
 		GasLimit:  gasLimit,
+		BaseFee:   p.blockchain.CalculateBaseFee(parent),
 		TxPool:    txPool,
 		Logger:    logger,
 	}), nil
@@ -179,8 +186,16 @@ func (p *blockchainWrapper) SubscribeEvents() blockchain.Subscription {
 	return p.blockchain.SubscribeEvents()
 }
 
+func (p *blockchainWrapper) UnubscribeEvents(subscription blockchain.Subscription) {
+	p.blockchain.UnsubscribeEvents(subscription)
+}
+
 func (p *blockchainWrapper) GetChainID() uint64 {
 	return uint64(p.blockchain.Config().ChainID)
+}
+
+func (p *blockchainWrapper) GetReceiptsByHash(hash types.Hash) ([]*types.Receipt, error) {
+	return p.blockchain.GetReceiptsByHash(hash)
 }
 
 var _ contract.Provider = &stateProvider{}

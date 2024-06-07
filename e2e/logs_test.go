@@ -135,7 +135,7 @@ func TestNewFilter_Block(t *testing.T) {
 		if _, sendErr := srv.SendRawTx(ctx, &framework.PreparedTransaction{
 			From:     from,
 			To:       &to,
-			GasPrice: big.NewInt(10000),
+			GasPrice: ethgo.Gwei(1),
 			Gas:      1000000,
 			Value:    big.NewInt(10000),
 		}, fromKey); err != nil {

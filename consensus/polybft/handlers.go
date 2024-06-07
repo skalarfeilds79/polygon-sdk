@@ -1,6 +1,10 @@
 package polybft
 
-import "github.com/0xPolygon/polygon-edge/types"
+import (
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/validator"
+	"github.com/0xPolygon/polygon-edge/types"
+	bolt "go.etcd.io/bbolt"
+)
 
 type PostBlockRequest struct {
 	// FullBlock is a reference of the executed block
@@ -9,6 +13,9 @@ type PostBlockRequest struct {
 	Epoch uint64
 	// IsEpochEndingBlock indicates if this was the last block of given epoch
 	IsEpochEndingBlock bool
+	// DBTx is the opened transaction on state store (in our case boltDB)
+	// used to save necessary data on PostBlock
+	DBTx *bolt.Tx
 }
 
 type PostEpochRequest struct {
@@ -23,5 +30,9 @@ type PostEpochRequest struct {
 	SystemState SystemState
 
 	// ValidatorSet is the validator set for the new epoch
-	ValidatorSet *validatorSet
+	ValidatorSet validator.ValidatorSet
+
+	// DBTx is the opened transaction on state store (in our case boltDB)
+	// used to save necessary data on PostEpoch
+	DBTx *bolt.Tx
 }

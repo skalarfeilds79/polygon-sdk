@@ -8,6 +8,8 @@ import (
 	"math/big"
 	"os"
 
+	"github.com/umbracle/ethgo/abi"
+
 	"github.com/0xPolygon/polygon-edge/chain"
 	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/state"
@@ -15,7 +17,6 @@ import (
 	"github.com/0xPolygon/polygon-edge/state/runtime"
 	"github.com/0xPolygon/polygon-edge/state/runtime/evm"
 	"github.com/0xPolygon/polygon-edge/types"
-	"github.com/umbracle/ethgo/abi"
 )
 
 var (
@@ -116,7 +117,7 @@ func getModifiedStorageMap(radix *state.Txn, address types.Address) map[types.Ha
 	return storageMap
 }
 
-func getPredeployAccount(address types.Address, input, deployedBytecode []byte) (*chain.GenesisAccount, error) {
+func getPredeployAccount(address types.Address, input []byte, chainID int64) (*chain.GenesisAccount, error) {
 	// Create an instance of the state
 	st := itrie.NewState(itrie.NewMemoryStorage())
 
@@ -142,6 +143,7 @@ func getPredeployAccount(address types.Address, input, deployedBytecode []byte) 
 
 	// Create a transition
 	transition := state.NewTransition(config, snapshot, radix)
+	transition.ContextPtr().ChainID = chainID
 
 	// Run the transition through the EVM
 	res := evm.NewEVM().Run(contract, transition, &config)
@@ -153,12 +155,15 @@ func getPredeployAccount(address types.Address, input, deployedBytecode []byte) 
 	// the state needs to be walked to collect all touched all storage slots
 	storageMap := getModifiedStorageMap(radix, address)
 
-	transition.Commit()
+	_, _, err := transition.Commit()
+	if err != nil {
+		return nil, fmt.Errorf("failed to commit the state changes: %w", err)
+	}
 
 	return &chain.GenesisAccount{
 		Balance: transition.GetBalance(address),
 		Nonce:   transition.GetNonce(address),
-		Code:    deployedBytecode,
+		Code:    res.ReturnValue,
 		Storage: storageMap,
 	}, nil
 }
@@ -169,6 +174,7 @@ func GenerateGenesisAccountFromFile(
 	filepath string,
 	constructorArgs []string,
 	predeployAddress types.Address,
+	chainID int64,
 ) (*chain.GenesisAccount, error) {
 	// Create the artifact from JSON
 	artifact, err := loadContractArtifact(filepath)
@@ -182,24 +188,29 @@ func GenerateGenesisAccountFromFile(
 		return nil, fmt.Errorf("unable to create contract ABI, %w", err)
 	}
 
-	// Constructor arguments are passed in as an array of values.
-	// Structs are treated as sub-arrays with their corresponding values laid out
-	// in ABI encoding
-	parsedArguments, err := ParseArguments(constructorArgs)
-	if err != nil {
-		return nil, err
+	finalBytecode := artifact.Bytecode
+	constructorInfo := contractABI.Constructor
+
+	if constructorInfo != nil {
+		// Constructor arguments are passed in as an array of values.
+		// Structs are treated as sub-arrays with their corresponding values laid out
+		// in ABI encoding
+		parsedArguments, err := ParseArguments(constructorArgs)
+		if err != nil {
+			return nil, err
+		}
+
+		// Encode the constructor params
+		constructor, err := abi.Encode(
+			parsedArguments,
+			contractABI.Constructor.Inputs,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to encode constructor arguments, %w", err)
+		}
+
+		finalBytecode = append(artifact.Bytecode, constructor...)
 	}
 
-	// Encode the constructor params
-	constructor, err := abi.Encode(
-		parsedArguments,
-		contractABI.Constructor.Inputs,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("unable to encode constructor arguments, %w", err)
-	}
-
-	finalBytecode := append(artifact.Bytecode, constructor...)
-
-	return getPredeployAccount(predeployAddress, finalBytecode, artifact.DeployedBytecode)
+	return getPredeployAccount(predeployAddress, finalBytecode, chainID)
 }

@@ -2,11 +2,13 @@ package state
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"testing"
 
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type mockSnapshot struct {
@@ -45,7 +47,11 @@ func (m *mockSnapshot) GetCode(hash types.Hash) ([]byte, bool) {
 	return nil, false
 }
 
-func newStateWithPreState(preState map[types.Address]*PreState) readSnapshot {
+func (m *mockSnapshot) Commit(objs []*Object) (Snapshot, []byte, error) {
+	return nil, nil, nil
+}
+
+func newStateWithPreState(preState map[types.Address]*PreState) Snapshot {
 	return &mockSnapshot{state: preState}
 }
 
@@ -63,6 +69,26 @@ func TestSnapshotUpdateData(t *testing.T) {
 	txn.SetState(addr1, hash1, hash2)
 	assert.Equal(t, hash2, txn.GetState(addr1, hash1))
 
-	txn.RevertToSnapshot(ss)
+	assert.NoError(t, txn.RevertToSnapshot(ss))
 	assert.Equal(t, hash1, txn.GetState(addr1, hash1))
+}
+
+func TestIncrNonce(t *testing.T) {
+	t.Parallel()
+
+	var (
+		address0               = types.StringToAddress("0")
+		address1               = types.StringToAddress("1")
+		maxUint64NonceValue    = uint64(math.MaxUint64)
+		nonMaxUint64NonceValue = uint64(3)
+	)
+
+	txn := newTestTxn(defaultPreState)
+
+	txn.SetNonce(address0, maxUint64NonceValue)
+	txn.SetNonce(address1, nonMaxUint64NonceValue)
+
+	require.Error(t, txn.IncrNonce(address0))
+	require.NoError(t, txn.IncrNonce(address1))
+	require.Equal(t, nonMaxUint64NonceValue+1, txn.GetNonce(address1))
 }

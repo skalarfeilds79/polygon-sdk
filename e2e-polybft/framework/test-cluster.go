@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"os/exec"
@@ -19,7 +18,8 @@ import (
 	"time"
 
 	"github.com/0xPolygon/polygon-edge/command/genesis"
-	"github.com/0xPolygon/polygon-edge/command/rootchain/helper"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/contractsapi"
 	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/txrelayer"
 	"github.com/0xPolygon/polygon-edge/types"
@@ -43,16 +43,37 @@ const (
 	// envStdoutEnabled signal whether the output of the nodes get piped to stdout
 	envStdoutEnabled = "E2E_STDOUT"
 
-	// envE2ETestsType used just to display type of test if skipped
-	envE2ETestsType = "E2E_TESTS_TYPE"
-)
-
-const (
 	// prefix for validator directory
 	defaultValidatorPrefix = "test-chain-"
+
+	// prefix for non validators directory
+	nonValidatorPrefix = "test-non-validator-"
+
+	// NativeTokenMintableTestCfg is the test native token config for Supernets originated native tokens
+	NativeTokenMintableTestCfg = "Mintable Edge Coin:MEC:18:true:%s" //nolint:gosec
 )
 
-var startTime int64
+type NodeType int
+
+const (
+	None      NodeType = 0
+	Validator NodeType = 1
+	Relayer   NodeType = 2
+)
+
+func (nt NodeType) IsSet(value NodeType) bool {
+	return nt&value == value
+}
+
+func (nt *NodeType) Append(value NodeType) {
+	*nt |= value
+}
+
+var (
+	startTime              int64
+	testRewardWalletAddr   = types.StringToAddress("0xFFFFFFFF")
+	ProxyContractAdminAddr = "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed"
+)
 
 func init() {
 	startTime = time.Now().UTC().UnixMilli()
@@ -70,35 +91,50 @@ func resolveBinary() string {
 type TestClusterConfig struct {
 	t *testing.T
 
-	Name                string
-	Premine             []string // address[:amount]
-	PremineValidators   []string // address:[amount]
-	StakeAmounts        []string // address[:amount]
-	MintableNativeToken bool
-	HasBridge           bool
-	BootnodeCount       int
-	NonValidatorCount   int
-	WithLogs            bool
-	WithStdout          bool
-	LogsDir             string
-	TmpDir              string
-	BlockGasLimit       uint64
-	ValidatorPrefix     string
-	Binary              string
-	ValidatorSetSize    uint64
-	EpochSize           int
-	EpochReward         int
-	SecretsCallback     func([]types.Address, *TestClusterConfig)
+	Name                 string
+	Premine              []string // address[:amount]
+	StakeAmounts         []*big.Int
+	BootnodeCount        int
+	NonValidatorCount    int
+	WithLogs             bool
+	WithStdout           bool
+	LogsDir              string
+	TmpDir               string
+	BlockGasLimit        uint64
+	BlockTime            time.Duration
+	BurnContract         *polybft.BurnContractInfo
+	ValidatorPrefix      string
+	Binary               string
+	ValidatorSetSize     uint64
+	EpochSize            int
+	EpochReward          int
+	NativeTokenConfigRaw string
+	SecretsCallback      func([]types.Address, *TestClusterConfig)
 
 	ContractDeployerAllowListAdmin   []types.Address
 	ContractDeployerAllowListEnabled []types.Address
+	ContractDeployerBlockListAdmin   []types.Address
+	ContractDeployerBlockListEnabled []types.Address
 	TransactionsAllowListAdmin       []types.Address
 	TransactionsAllowListEnabled     []types.Address
+	TransactionsBlockListAdmin       []types.Address
+	TransactionsBlockListEnabled     []types.Address
+	BridgeAllowListAdmin             []types.Address
+	BridgeAllowListEnabled           []types.Address
+	BridgeBlockListAdmin             []types.Address
+	BridgeBlockListEnabled           []types.Address
 
 	NumBlockConfirmations uint64
 
 	InitialTrieDB    string
 	InitialStateRoot types.Hash
+
+	IsPropertyTest  bool
+	TestRewardToken string
+
+	RootTrackerPollInterval time.Duration
+
+	ProxyContractsAdmin string
 
 	logsDirOnce sync.Once
 }
@@ -147,6 +183,12 @@ func (c *TestClusterConfig) GetStdout(name string, custom ...io.Writer) io.Write
 
 func (c *TestClusterConfig) initLogsDir() {
 	logsDir := path.Join("../..", fmt.Sprintf("e2e-logs-%d", startTime), c.t.Name())
+	if c.IsPropertyTest {
+		// property tests run cluster multiple times, so each cluster run will be in the main folder
+		// e2e-logs-{someNumber}/NameOfPropertyTest/NameOfPropertyTest-{someNumber}
+		// to have a separation between logs of each cluster run
+		logsDir = path.Join(logsDir, fmt.Sprintf("%v-%d", c.t.Name(), time.Now().UTC().Unix()))
+	}
 
 	if err := common.CreateDirSafe(logsDir, 0750); err != nil {
 		c.t.Fatal(err)
@@ -154,6 +196,15 @@ func (c *TestClusterConfig) initLogsDir() {
 
 	c.t.Logf("logs enabled for e2e test: %s", logsDir)
 	c.LogsDir = logsDir
+}
+
+func (c *TestClusterConfig) GetProxyContractsAdmin() string {
+	proxyAdminAddr := c.ProxyContractsAdmin
+	if proxyAdminAddr == "" {
+		proxyAdminAddr = ProxyContractAdminAddr
+	}
+
+	return proxyAdminAddr
 }
 
 type TestCluster struct {
@@ -179,21 +230,9 @@ func WithPremine(addresses ...types.Address) ClusterOption {
 	}
 }
 
-func WithMintableNativeToken(mintableToken bool) ClusterOption {
-	return func(h *TestClusterConfig) {
-		h.MintableNativeToken = mintableToken
-	}
-}
-
 func WithSecretsCallback(fn func([]types.Address, *TestClusterConfig)) ClusterOption {
 	return func(h *TestClusterConfig) {
 		h.SecretsCallback = fn
-	}
-}
-
-func WithBridge() ClusterOption {
-	return func(h *TestClusterConfig) {
-		h.HasBridge = true
 	}
 }
 
@@ -234,9 +273,21 @@ func WithEpochReward(epochReward int) ClusterOption {
 	}
 }
 
+func WithBlockTime(blockTime time.Duration) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.BlockTime = blockTime
+	}
+}
+
 func WithBlockGasLimit(blockGasLimit uint64) ClusterOption {
 	return func(h *TestClusterConfig) {
 		h.BlockGasLimit = blockGasLimit
+	}
+}
+
+func WithBurnContract(burnContract *polybft.BurnContractInfo) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.BurnContract = burnContract
 	}
 }
 
@@ -258,6 +309,18 @@ func WithContractDeployerAllowListEnabled(addr types.Address) ClusterOption {
 	}
 }
 
+func WithContractDeployerBlockListAdmin(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.ContractDeployerBlockListAdmin = append(h.ContractDeployerBlockListAdmin, addr)
+	}
+}
+
+func WithContractDeployerBlockListEnabled(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.ContractDeployerBlockListEnabled = append(h.ContractDeployerBlockListEnabled, addr)
+	}
+}
+
 func WithTransactionsAllowListAdmin(addr types.Address) ClusterOption {
 	return func(h *TestClusterConfig) {
 		h.TransactionsAllowListAdmin = append(h.TransactionsAllowListAdmin, addr)
@@ -270,8 +333,82 @@ func WithTransactionsAllowListEnabled(addr types.Address) ClusterOption {
 	}
 }
 
+func WithTransactionsBlockListAdmin(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.TransactionsBlockListAdmin = append(h.TransactionsBlockListAdmin, addr)
+	}
+}
+
+func WithTransactionsBlockListEnabled(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.TransactionsBlockListEnabled = append(h.TransactionsBlockListEnabled, addr)
+	}
+}
+
+func WithBridgeAllowListAdmin(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.BridgeAllowListAdmin = append(h.BridgeAllowListAdmin, addr)
+	}
+}
+
+func WithBridgeAllowListEnabled(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.BridgeAllowListEnabled = append(h.BridgeAllowListEnabled, addr)
+	}
+}
+
+func WithBridgeBlockListAdmin(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.BridgeBlockListAdmin = append(h.BridgeBlockListAdmin, addr)
+	}
+}
+
+func WithBridgeBlockListEnabled(addr types.Address) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.BridgeBlockListEnabled = append(h.BridgeBlockListEnabled, addr)
+	}
+}
+
+func WithPropertyTestLogging() ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.IsPropertyTest = true
+	}
+}
+
+func WithNativeTokenConfig(tokenConfigRaw string) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.NativeTokenConfigRaw = tokenConfigRaw
+	}
+}
+
+func WithTestRewardToken() ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.TestRewardToken = hex.EncodeToString(contractsapi.TestRewardToken.DeployedBytecode)
+	}
+}
+
+func WithRootTrackerPollInterval(pollInterval time.Duration) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.RootTrackerPollInterval = pollInterval
+	}
+}
+
+func WithProxyContractsAdmin(address string) ClusterOption {
+	return func(h *TestClusterConfig) {
+		h.ProxyContractsAdmin = address
+	}
+}
+
 func isTrueEnv(e string) bool {
 	return strings.ToLower(os.Getenv(e)) == "true"
+}
+
+func NewPropertyTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *TestCluster {
+	t.Helper()
+
+	opts = append(opts, WithPropertyTestLogging())
+
+	return NewTestCluster(t, validatorsCount, opts...)
 }
 
 func NewTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *TestCluster {
@@ -280,15 +417,14 @@ func NewTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *T
 	var err error
 
 	config := &TestClusterConfig{
-		t:                 t,
-		WithLogs:          isTrueEnv(envLogsEnabled),
-		WithStdout:        isTrueEnv(envStdoutEnabled),
-		Binary:            resolveBinary(),
-		EpochSize:         10,
-		EpochReward:       1,
-		BlockGasLimit:     1e7, // 10M
-		PremineValidators: []string{},
-		StakeAmounts:      []string{},
+		t:             t,
+		WithLogs:      isTrueEnv(envLogsEnabled),
+		WithStdout:    isTrueEnv(envStdoutEnabled),
+		Binary:        resolveBinary(),
+		EpochSize:     10,
+		EpochReward:   1,
+		BlockGasLimit: 1e7, // 10M
+		StakeAmounts:  []*big.Int{},
 	}
 
 	if config.ValidatorPrefix == "" {
@@ -300,8 +436,10 @@ func NewTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *T
 	}
 
 	if !isTrueEnv(envE2ETestsEnabled) {
-		testType := os.Getenv(envE2ETestsType)
-		if testType == "" {
+		var testType string
+		if config.IsPropertyTest {
+			testType = "property"
+		} else {
 			testType = "integration"
 		}
 
@@ -319,83 +457,78 @@ func NewTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *T
 		once:        sync.Once{},
 	}
 
-	{
-		// run init accounts
-		addresses, err := cluster.InitSecrets(cluster.Config.ValidatorPrefix, validatorsCount)
-		require.NoError(t, err)
-
-		if cluster.Config.SecretsCallback != nil {
-			cluster.Config.SecretsCallback(addresses, cluster.Config)
-		}
-	}
-
-	manifestPath := path.Join(config.TmpDir, "manifest.json")
-	args := []string{
-		"manifest",
-		"--path", manifestPath,
-		"--validators-path", config.TmpDir,
-		"--validators-prefix", cluster.Config.ValidatorPrefix,
-	}
-
-	// premine validators
-	for _, premineValidator := range cluster.Config.PremineValidators {
-		args = append(args, "--premine-validators", premineValidator)
-	}
-
-	for _, validatorStake := range cluster.Config.StakeAmounts {
-		args = append(args, "--stake", validatorStake)
-	}
-
-	// run manifest file creation
-	require.NoError(t, cluster.cmdRun(args...))
-
-	if cluster.Config.HasBridge {
-		// start bridge
-		cluster.Bridge, err = NewTestBridge(t, cluster.Config)
-		require.NoError(t, err)
-	}
-
 	// in case no validators are specified in opts, all nodes will be validators
 	if cluster.Config.ValidatorSetSize == 0 {
 		cluster.Config.ValidatorSetSize = uint64(validatorsCount)
 	}
 
-	if cluster.Config.HasBridge {
-		err := cluster.Bridge.deployRootchainContracts(manifestPath)
-		require.NoError(t, err)
+	// run init accounts for validators
+	addresses, err := cluster.InitSecrets(cluster.Config.ValidatorPrefix, int(cluster.Config.ValidatorSetSize))
+	require.NoError(t, err)
 
-		err = cluster.Bridge.fundRootchainValidators()
+	if cluster.Config.SecretsCallback != nil {
+		cluster.Config.SecretsCallback(addresses, cluster.Config)
+	}
+
+	if config.NonValidatorCount > 0 {
+		// run init accounts for non-validators
+		// we don't call secrets callback on non-validators,
+		// since we have nothing to premine nor stake for non validators
+		_, err = cluster.InitSecrets(nonValidatorPrefix, config.NonValidatorCount)
 		require.NoError(t, err)
 	}
+
+	genesisPath := path.Join(config.TmpDir, "genesis.json")
 
 	{
 		// run genesis configuration population
 		args := []string{
 			"genesis",
-			"--manifest", manifestPath,
-			"--consensus", "polybft",
-			"--dir", path.Join(config.TmpDir, "genesis.json"),
+			"--validators-path", config.TmpDir,
+			"--validators-prefix", cluster.Config.ValidatorPrefix,
+			"--dir", genesisPath,
 			"--block-gas-limit", strconv.FormatUint(cluster.Config.BlockGasLimit, 10),
 			"--epoch-size", strconv.Itoa(cluster.Config.EpochSize),
 			"--epoch-reward", strconv.Itoa(cluster.Config.EpochReward),
 			"--premine", "0x0000000000000000000000000000000000000000",
+			"--reward-wallet", testRewardWalletAddr.String(),
 			"--trieroot", cluster.Config.InitialStateRoot.String(),
 		}
 
-		if len(cluster.Config.Premine) != 0 {
+		if cluster.Config.BlockTime != 0 {
+			args = append(args, "--block-time",
+				cluster.Config.BlockTime.String())
+		}
+
+		if cluster.Config.RootTrackerPollInterval != 0 {
+			args = append(args, "--block-tracker-poll-interval",
+				cluster.Config.RootTrackerPollInterval.String())
+		}
+
+		if cluster.Config.TestRewardToken != "" {
+			args = append(args, "--reward-token-code", cluster.Config.TestRewardToken)
+		}
+
+		// add optional genesis flags
+		if cluster.Config.NativeTokenConfigRaw != "" {
+			args = append(args, "--native-token-config", cluster.Config.NativeTokenConfigRaw)
+		}
+
+		tokenConfig, err := polybft.ParseRawTokenConfig(cluster.Config.NativeTokenConfigRaw)
+		require.NoError(t, err)
+
+		if len(cluster.Config.Premine) != 0 && tokenConfig.IsMintable {
+			// only add premine flags in genesis if token is mintable
 			for _, premine := range cluster.Config.Premine {
 				args = append(args, "--premine", premine)
 			}
 		}
 
-		if cluster.Config.MintableNativeToken {
-			args = append(args, "--mintable-native-token")
-		}
-
-		if cluster.Config.HasBridge {
-			rootchainIP, err := helper.ReadRootchainIP()
-			require.NoError(t, err)
-			args = append(args, "--bridge-json-rpc", rootchainIP)
+		burnContract := cluster.Config.BurnContract
+		if burnContract != nil {
+			args = append(args, "--burn-contract",
+				fmt.Sprintf("%d:%s:%s",
+					burnContract.BlockNumber, burnContract.Address, burnContract.DestinationAddress))
 		}
 
 		validators, err := genesis.ReadValidatorsByPrefix(
@@ -413,10 +546,6 @@ func NewTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *T
 			}
 		}
 
-		if cluster.Config.ValidatorSetSize > 0 {
-			args = append(args, "--validator-set-size", fmt.Sprint(cluster.Config.ValidatorSetSize))
-		}
-
 		if len(cluster.Config.ContractDeployerAllowListAdmin) != 0 {
 			args = append(args, "--contract-deployer-allow-list-admin",
 				strings.Join(sliceAddressToSliceString(cluster.Config.ContractDeployerAllowListAdmin), ","))
@@ -425,6 +554,16 @@ func NewTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *T
 		if len(cluster.Config.ContractDeployerAllowListEnabled) != 0 {
 			args = append(args, "--contract-deployer-allow-list-enabled",
 				strings.Join(sliceAddressToSliceString(cluster.Config.ContractDeployerAllowListEnabled), ","))
+		}
+
+		if len(cluster.Config.ContractDeployerBlockListAdmin) != 0 {
+			args = append(args, "--contract-deployer-block-list-admin",
+				strings.Join(sliceAddressToSliceString(cluster.Config.ContractDeployerBlockListAdmin), ","))
+		}
+
+		if len(cluster.Config.ContractDeployerBlockListEnabled) != 0 {
+			args = append(args, "--contract-deployer-block-list-enabled",
+				strings.Join(sliceAddressToSliceString(cluster.Config.ContractDeployerBlockListEnabled), ","))
 		}
 
 		if len(cluster.Config.TransactionsAllowListAdmin) != 0 {
@@ -437,29 +576,117 @@ func NewTestCluster(t *testing.T, validatorsCount int, opts ...ClusterOption) *T
 				strings.Join(sliceAddressToSliceString(cluster.Config.TransactionsAllowListEnabled), ","))
 		}
 
-		// run cmd init-genesis with all the arguments
+		if len(cluster.Config.TransactionsBlockListAdmin) != 0 {
+			args = append(args, "--transactions-block-list-admin",
+				strings.Join(sliceAddressToSliceString(cluster.Config.TransactionsBlockListAdmin), ","))
+		}
+
+		if len(cluster.Config.TransactionsBlockListEnabled) != 0 {
+			args = append(args, "--transactions-block-list-enabled",
+				strings.Join(sliceAddressToSliceString(cluster.Config.TransactionsBlockListEnabled), ","))
+		}
+
+		if len(cluster.Config.BridgeAllowListAdmin) != 0 {
+			args = append(args, "--bridge-allow-list-admin",
+				strings.Join(sliceAddressToSliceString(cluster.Config.BridgeAllowListAdmin), ","))
+		}
+
+		if len(cluster.Config.BridgeAllowListEnabled) != 0 {
+			args = append(args, "--bridge-allow-list-enabled",
+				strings.Join(sliceAddressToSliceString(cluster.Config.BridgeAllowListEnabled), ","))
+		}
+
+		if len(cluster.Config.BridgeBlockListAdmin) != 0 {
+			args = append(args, "--bridge-block-list-admin",
+				strings.Join(sliceAddressToSliceString(cluster.Config.BridgeBlockListAdmin), ","))
+		}
+
+		if len(cluster.Config.BridgeBlockListEnabled) != 0 {
+			args = append(args, "--bridge-block-list-enabled",
+				strings.Join(sliceAddressToSliceString(cluster.Config.BridgeBlockListEnabled), ","))
+		}
+
+		proxyAdminAddr := cluster.Config.ProxyContractsAdmin
+		if proxyAdminAddr == "" {
+			proxyAdminAddr = ProxyContractAdminAddr
+		}
+		args = append(args, "--proxy-contracts-admin", proxyAdminAddr)
+
+		// run genesis command with all the arguments
 		err = cluster.cmdRun(args...)
 		require.NoError(t, err)
 	}
 
+	// start bridge
+	cluster.Bridge, err = NewTestBridge(t, cluster.Config)
+	require.NoError(t, err)
+
+	// deploy stake manager contract
+	err = cluster.Bridge.deployStakeManager(genesisPath)
+	require.NoError(t, err)
+
+	// deploy rootchain contracts
+	err = cluster.Bridge.deployRootchainContracts(genesisPath)
+	require.NoError(t, err)
+
+	polybftConfig, err := polybft.LoadPolyBFTConfig(genesisPath)
+	require.NoError(t, err)
+
+	tokenConfig, err := polybft.ParseRawTokenConfig(cluster.Config.NativeTokenConfigRaw)
+	require.NoError(t, err)
+
+	// fund addresses on the rootchain
+	err = cluster.Bridge.fundAddressesOnRoot(tokenConfig, polybftConfig)
+	require.NoError(t, err)
+
+	// whitelist genesis validators on the rootchain
+	err = cluster.Bridge.whitelistValidators(addresses, polybftConfig)
+	require.NoError(t, err)
+
+	// register genesis validators on the rootchain
+	err = cluster.Bridge.registerGenesisValidators(polybftConfig)
+	require.NoError(t, err)
+
+	// do initial staking for genesis validators on the rootchain
+	err = cluster.Bridge.initialStakingOfGenesisValidators(polybftConfig)
+	require.NoError(t, err)
+
+	// add premine if token is non-mintable
+	err = cluster.Bridge.mintNativeRootToken(addresses, tokenConfig, polybftConfig)
+	require.NoError(t, err)
+
+	err = cluster.Bridge.premineNativeRootToken(tokenConfig, polybftConfig)
+	require.NoError(t, err)
+
+	// finalize genesis validators on the rootchain
+	err = cluster.Bridge.finalizeGenesis(genesisPath, polybftConfig)
+	require.NoError(t, err)
+
 	for i := 1; i <= int(cluster.Config.ValidatorSetSize); i++ {
-		cluster.InitTestServer(t, i, true, cluster.Config.HasBridge && i == 1 /* relayer */)
+		nodeType := Validator
+		if i == 1 {
+			nodeType.Append(Relayer)
+		}
+
+		dir := cluster.Config.ValidatorPrefix + strconv.Itoa(i)
+		cluster.InitTestServer(t, dir, cluster.Bridge.JSONRPCAddr(), nodeType)
 	}
 
 	for i := 1; i <= cluster.Config.NonValidatorCount; i++ {
-		offsetIndex := i + int(cluster.Config.ValidatorSetSize)
-		cluster.InitTestServer(t, offsetIndex, false, false /* relayer */)
+		dir := nonValidatorPrefix + strconv.Itoa(i)
+		cluster.InitTestServer(t, dir, cluster.Bridge.JSONRPCAddr(), None)
 	}
 
 	return cluster
 }
 
-func (c *TestCluster) InitTestServer(t *testing.T, i int, isValidator bool, relayer bool) {
+func (c *TestCluster) InitTestServer(t *testing.T,
+	dataDir string, bridgeJSONRPC string, nodeType NodeType) {
 	t.Helper()
 
 	logLevel := os.Getenv(envLogLevel)
 
-	dataDir := c.Config.Dir(c.Config.ValidatorPrefix + strconv.Itoa(i))
+	dataDir = c.Config.Dir(dataDir)
 	if c.Config.InitialTrieDB != "" {
 		err := CopyDir(c.Config.InitialTrieDB, filepath.Join(dataDir, "trie"))
 		if err != nil {
@@ -467,14 +694,15 @@ func (c *TestCluster) InitTestServer(t *testing.T, i int, isValidator bool, rela
 		}
 	}
 
-	srv := NewTestServer(t, c.Config, func(config *TestServerConfig) {
+	srv := NewTestServer(t, c.Config, bridgeJSONRPC, func(config *TestServerConfig) {
 		config.DataDir = dataDir
-		config.Seal = isValidator
+		config.Validator = nodeType.IsSet(Validator)
 		config.Chain = c.Config.Dir("genesis.json")
 		config.P2PPort = c.getOpenPort()
 		config.LogLevel = logLevel
-		config.Relayer = relayer
+		config.Relayer = nodeType.IsSet(Relayer)
 		config.NumBlockConfirmations = c.Config.NumBlockConfirmations
+		config.BridgeJSONRPC = bridgeJSONRPC
 	})
 
 	// watch the server for stop signals. It is important to fix the specific
@@ -522,7 +750,7 @@ func (c *TestCluster) Stats(t *testing.T) {
 		}
 
 		num, err := i.JSONRPC().Eth().BlockNumber()
-		t.Log("Stats node", index, "err", err, "block", num, "validator", i.config.Seal)
+		t.Log("Stats node", index, "err", err, "block", num, "validator", i.config.Validator)
 	}
 }
 
@@ -548,7 +776,7 @@ func (c *TestCluster) WaitUntil(timeout, pollFrequency time.Duration, handler fu
 func (c *TestCluster) WaitForReady(t *testing.T) {
 	t.Helper()
 
-	require.NoError(t, c.WaitForBlock(1, 30*time.Second))
+	require.NoError(t, c.WaitForBlock(1, time.Minute))
 }
 
 func (c *TestCluster) WaitForBlock(n uint64, timeout time.Duration) error {
@@ -703,7 +931,7 @@ func (c *TestCluster) Call(t *testing.T, to types.Address, method *abi.Method,
 func (c *TestCluster) Deploy(t *testing.T, sender ethgo.Key, bytecode []byte) *TestTxn {
 	t.Helper()
 
-	return c.SendTxn(t, sender, &ethgo.Transaction{Input: bytecode})
+	return c.SendTxn(t, sender, &ethgo.Transaction{From: sender.Address(), Input: bytecode})
 }
 
 func (c *TestCluster) Transfer(t *testing.T, sender ethgo.Key, target types.Address, value *big.Int) *TestTxn {
@@ -711,7 +939,7 @@ func (c *TestCluster) Transfer(t *testing.T, sender ethgo.Key, target types.Addr
 
 	targetAddr := ethgo.Address(target)
 
-	return c.SendTxn(t, sender, &ethgo.Transaction{To: &targetAddr, Value: value})
+	return c.SendTxn(t, sender, &ethgo.Transaction{From: sender.Address(), To: &targetAddr, Value: value})
 }
 
 func (c *TestCluster) MethodTxn(t *testing.T, sender ethgo.Key, target types.Address, input []byte) *TestTxn {
@@ -719,7 +947,7 @@ func (c *TestCluster) MethodTxn(t *testing.T, sender ethgo.Key, target types.Add
 
 	targetAddr := ethgo.Address(target)
 
-	return c.SendTxn(t, sender, &ethgo.Transaction{To: &targetAddr, Input: input})
+	return c.SendTxn(t, sender, &ethgo.Transaction{From: sender.Address(), To: &targetAddr, Input: input})
 }
 
 // SendTxn sends a transaction
@@ -745,11 +973,23 @@ func (c *TestCluster) SendTxn(t *testing.T, sender ethgo.Key, txn *ethgo.Transac
 	}
 
 	if txn.GasPrice == 0 {
-		txn.GasPrice = txrelayer.DefaultGasPrice
+		gasPrice, err := client.Eth().GasPrice()
+		require.NoError(t, err)
+
+		txn.GasPrice = gasPrice
 	}
 
 	if txn.Gas == 0 {
-		txn.Gas = txrelayer.DefaultGasLimit
+		callMsg := txrelayer.ConvertTxnToCallMsg(txn)
+
+		gasLimit, err := client.Eth().EstimateGas(callMsg)
+		if err != nil {
+			// gas estimation can fail in case an account is not allow-listed
+			// (fallback it to default gas limit in that case)
+			txn.Gas = txrelayer.DefaultGasLimit
+		} else {
+			txn.Gas = gasLimit
+		}
 	}
 
 	chainID, err := client.Eth().ChainID()
@@ -765,13 +1005,11 @@ func (c *TestCluster) SendTxn(t *testing.T, sender ethgo.Key, txn *ethgo.Transac
 	hash, err := client.Eth().SendRawTransaction(txnRaw)
 	require.NoError(t, err)
 
-	tTxn := &TestTxn{
+	return &TestTxn{
 		client: client.Eth(),
 		txn:    txn,
 		hash:   hash,
 	}
-
-	return tTxn
 }
 
 type TestTxn struct {
@@ -854,11 +1092,11 @@ func CopyDir(source, destination string) error {
 			return nil
 		}
 
-		data, err := ioutil.ReadFile(filepath.Join(source, relPath))
+		data, err := os.ReadFile(filepath.Join(source, relPath))
 		if err != nil {
 			return err
 		}
 
-		return ioutil.WriteFile(filepath.Join(destination, relPath), data, 0600)
+		return os.WriteFile(filepath.Join(destination, relPath), data, 0600)
 	})
 }

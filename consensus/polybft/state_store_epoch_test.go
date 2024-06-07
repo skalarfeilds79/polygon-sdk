@@ -5,7 +5,8 @@ import (
 	"sync"
 	"testing"
 
-	bls "github.com/0xPolygon/polygon-edge/consensus/polybft/signer"
+	"github.com/0xPolygon/polygon-edge/bls"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/validator"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,13 +25,14 @@ func TestState_insertAndGetValidatorSnapshot(t *testing.T) {
 
 	require.NoError(t, err)
 
-	snapshot := AccountSet{
-		&ValidatorMetadata{Address: types.BytesToAddress([]byte{0x18}), BlsKey: keys[0].PublicKey()},
-		&ValidatorMetadata{Address: types.BytesToAddress([]byte{0x23}), BlsKey: keys[1].PublicKey()},
-		&ValidatorMetadata{Address: types.BytesToAddress([]byte{0x37}), BlsKey: keys[2].PublicKey()},
+	snapshot := validator.AccountSet{
+		&validator.ValidatorMetadata{Address: types.BytesToAddress([]byte{0x18}), BlsKey: keys[0].PublicKey()},
+		&validator.ValidatorMetadata{Address: types.BytesToAddress([]byte{0x23}), BlsKey: keys[1].PublicKey()},
+		&validator.ValidatorMetadata{Address: types.BytesToAddress([]byte{0x37}), BlsKey: keys[2].PublicKey()},
 	}
 
-	assert.NoError(t, state.EpochStore.insertValidatorSnapshot(&validatorSnapshot{epoch, epochEndingBlock, snapshot}))
+	assert.NoError(t, state.EpochStore.insertValidatorSnapshot(
+		&validatorSnapshot{epoch, epochEndingBlock, snapshot}, nil))
 
 	snapshotFromDB, err := state.EpochStore.getValidatorSnapshot(epoch)
 
@@ -53,17 +55,18 @@ func TestState_cleanValidatorSnapshotsFromDb(t *testing.T) {
 	keys, err := bls.CreateRandomBlsKeys(3)
 	require.NoError(t, err)
 
-	snapshot := AccountSet{
-		&ValidatorMetadata{Address: types.BytesToAddress([]byte{0x18}), BlsKey: keys[0].PublicKey()},
-		&ValidatorMetadata{Address: types.BytesToAddress([]byte{0x23}), BlsKey: keys[1].PublicKey()},
-		&ValidatorMetadata{Address: types.BytesToAddress([]byte{0x37}), BlsKey: keys[2].PublicKey()},
+	snapshot := validator.AccountSet{
+		&validator.ValidatorMetadata{Address: types.BytesToAddress([]byte{0x18}), BlsKey: keys[0].PublicKey()},
+		&validator.ValidatorMetadata{Address: types.BytesToAddress([]byte{0x23}), BlsKey: keys[1].PublicKey()},
+		&validator.ValidatorMetadata{Address: types.BytesToAddress([]byte{0x37}), BlsKey: keys[2].PublicKey()},
 	}
 
 	var epoch uint64
 	// add a couple of more snapshots above limit just to make sure we reached it
 	for i := 1; i <= validatorSnapshotLimit+2; i++ {
 		epoch = uint64(i)
-		assert.NoError(t, state.EpochStore.insertValidatorSnapshot(&validatorSnapshot{epoch, epoch * fixedEpochSize, snapshot}))
+		assert.NoError(t, state.EpochStore.insertValidatorSnapshot(
+			&validatorSnapshot{epoch, epoch * fixedEpochSize, snapshot}, nil))
 	}
 
 	snapshotFromDB, err := state.EpochStore.getValidatorSnapshot(epoch)
@@ -78,7 +81,7 @@ func TestState_cleanValidatorSnapshotsFromDb(t *testing.T) {
 		assert.Equal(t, v.BlsKey, snapshotFromDB.Snapshot[i].BlsKey)
 	}
 
-	assert.NoError(t, state.EpochStore.cleanValidatorSnapshotsFromDB(epoch))
+	assert.NoError(t, state.EpochStore.cleanValidatorSnapshotsFromDB(epoch, nil))
 
 	// test that last (numberOfSnapshotsToLeaveInDb) of snapshots are left in db after cleanup
 	validatorSnapshotsBucketStats, err := state.EpochStore.validatorSnapshotsDBStats()
@@ -99,7 +102,7 @@ func TestState_InsertVoteConcurrent(t *testing.T) {
 
 	state := newTestState(t)
 	epoch := uint64(1)
-	assert.NoError(t, state.EpochStore.insertEpoch(epoch))
+	assert.NoError(t, state.EpochStore.insertEpoch(epoch, nil))
 
 	hash := []byte{1, 2}
 
@@ -114,7 +117,7 @@ func TestState_InsertVoteConcurrent(t *testing.T) {
 			_, _ = state.StateSyncStore.insertMessageVote(epoch, hash, &MessageSignature{
 				From:      fmt.Sprintf("NODE_%d", i),
 				Signature: []byte{1, 2},
-			})
+			}, nil)
 		}(i)
 	}
 
@@ -133,14 +136,14 @@ func TestState_Insert_And_Cleanup(t *testing.T) {
 
 	for i := uint64(1); i <= 500; i++ {
 		epoch := i
-		err := state.EpochStore.insertEpoch(epoch)
+		err := state.EpochStore.insertEpoch(epoch, nil)
 
 		assert.NoError(t, err)
 
 		_, _ = state.StateSyncStore.insertMessageVote(epoch, hash1, &MessageSignature{
 			From:      "NODE_1",
 			Signature: []byte{1, 2},
-		})
+		}, nil)
 	}
 
 	stats, err := state.EpochStore.epochsDBStats()
@@ -151,7 +154,7 @@ func TestState_Insert_And_Cleanup(t *testing.T) {
 	// (500 buckets for epochs + each epoch has 1 nested bucket for message votes)
 	assert.Equal(t, 1000, stats.BucketN-1)
 
-	assert.NoError(t, state.EpochStore.cleanEpochsFromDB())
+	assert.NoError(t, state.EpochStore.cleanEpochsFromDB(nil))
 
 	stats, err = state.EpochStore.epochsDBStats()
 	require.NoError(t, err)
@@ -164,13 +167,13 @@ func TestState_Insert_And_Cleanup(t *testing.T) {
 
 	for i := uint64(501); i <= 1000; i++ {
 		epoch := i
-		err := state.EpochStore.insertEpoch(epoch)
+		err := state.EpochStore.insertEpoch(epoch, nil)
 		assert.NoError(t, err)
 
 		_, _ = state.StateSyncStore.insertMessageVote(epoch, hash1, &MessageSignature{
 			From:      "NODE_1",
 			Signature: []byte{1, 2},
-		})
+		}, nil)
 	}
 
 	stats, err = state.EpochStore.epochsDBStats()
@@ -198,15 +201,16 @@ func TestState_getLastSnapshot(t *testing.T) {
 
 		require.NoError(t, err)
 
-		var snapshot AccountSet
+		var snapshot validator.AccountSet
 		for j := 0; j < numberOfValidators; j++ {
-			snapshot = append(snapshot, &ValidatorMetadata{Address: types.BytesToAddress(generateRandomBytes(t)), BlsKey: keys[j].PublicKey()})
+			snapshot = append(snapshot, &validator.ValidatorMetadata{Address: types.BytesToAddress(generateRandomBytes(t)), BlsKey: keys[j].PublicKey()})
 		}
 
-		require.NoError(t, state.EpochStore.insertValidatorSnapshot(&validatorSnapshot{i, i * fixedEpochSize, snapshot}))
+		require.NoError(t, state.EpochStore.insertValidatorSnapshot(
+			&validatorSnapshot{i, i * fixedEpochSize, snapshot}, nil))
 	}
 
-	snapshotFromDB, err := state.EpochStore.getLastSnapshot()
+	snapshotFromDB, err := state.EpochStore.getLastSnapshot(nil)
 
 	assert.NoError(t, err)
 	assert.Equal(t, numberOfValidators, snapshotFromDB.Snapshot.Len())

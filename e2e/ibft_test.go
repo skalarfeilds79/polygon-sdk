@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/0xPolygon/polygon-edge/command/server/config"
 	ibftSigner "github.com/0xPolygon/polygon-edge/consensus/ibft/signer"
 	"github.com/0xPolygon/polygon-edge/e2e/framework"
 	"github.com/0xPolygon/polygon-edge/helper/tests"
@@ -19,6 +18,8 @@ import (
 // TestIbft_Transfer sends a transfer transaction (EOA -> EOA)
 // and verifies it was mined
 func TestIbft_Transfer(t *testing.T) {
+	const defaultBlockTime uint64 = 2
+
 	testCases := []struct {
 		name            string
 		blockTime       uint64
@@ -27,7 +28,7 @@ func TestIbft_Transfer(t *testing.T) {
 	}{
 		{
 			name:            "default block time",
-			blockTime:       config.DefaultBlockTime,
+			blockTime:       defaultBlockTime,
 			ibftBaseTimeout: 0, // use default value
 			validatorType:   validators.ECDSAValidatorType,
 		},
@@ -39,7 +40,7 @@ func TestIbft_Transfer(t *testing.T) {
 		},
 		{
 			name:            "with BLS",
-			blockTime:       config.DefaultBlockTime,
+			blockTime:       defaultBlockTime,
 			ibftBaseTimeout: 0, // use default value
 			validatorType:   validators.BLSValidatorType,
 		},
@@ -76,7 +77,7 @@ func TestIbft_Transfer(t *testing.T) {
 			txn := &framework.PreparedTransaction{
 				From:     senderAddr,
 				To:       &receiverAddr,
-				GasPrice: big.NewInt(10000),
+				GasPrice: ethgo.Gwei(2),
 				Gas:      1000000,
 				Value:    framework.EthToWei(1),
 			}
@@ -140,7 +141,7 @@ func TestIbft_TransactionFeeRecipient(t *testing.T) {
 			txn := &framework.PreparedTransaction{
 				From:     senderAddr,
 				To:       &receiverAddr,
-				GasPrice: big.NewInt(10000),
+				GasPrice: ethgo.Gwei(1),
 				Gas:      1000000,
 				Value:    tc.txAmount,
 			}
@@ -149,7 +150,7 @@ func TestIbft_TransactionFeeRecipient(t *testing.T) {
 				// Deploy contract
 				deployTx := &framework.PreparedTransaction{
 					From:     senderAddr,
-					GasPrice: big.NewInt(0), // don't want gas fee to paid to a proposer
+					GasPrice: ethgo.Gwei(1), // fees should be greater than base fee
 					Gas:      1000000,
 					Value:    big.NewInt(0),
 					Input:    framework.MethodSig("setA1"),

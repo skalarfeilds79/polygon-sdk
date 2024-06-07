@@ -8,12 +8,17 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/0xPolygon/polygon-edge/consensus"
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/contractsapi"
-	bls "github.com/0xPolygon/polygon-edge/consensus/polybft/signer"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/signer"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft/validator"
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/wallet"
+	"github.com/0xPolygon/polygon-edge/contracts"
 	"github.com/0xPolygon/polygon-edge/txrelayer"
 	"github.com/0xPolygon/polygon-edge/types"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/0xPolygon/go-ibft/messages"
 	"github.com/0xPolygon/go-ibft/messages/proto"
@@ -53,7 +58,7 @@ type epochMetadata struct {
 	FirstBlockInEpoch uint64
 
 	// Validators is the set of validators for the epoch
-	Validators AccountSet
+	Validators validator.AccountSet
 }
 
 type guardedDataDTO struct {
@@ -78,6 +83,7 @@ type runtimeConfig struct {
 	txPool                txPoolInterface
 	bridgeTopic           topic
 	numBlockConfirmations uint64
+	consensusConfig       *consensus.Config
 }
 
 // consensusRuntime is a struct that provides consensus runtime features like epoch, state and event management
@@ -101,7 +107,7 @@ type consensusRuntime struct {
 	lastBuiltBlock *types.Header
 
 	// activeValidatorFlag indicates whether the given node is amongst currently active validator set
-	activeValidatorFlag uint32
+	activeValidatorFlag atomic.Bool
 
 	// checkpointManager represents abstraction for checkpoint submission
 	checkpointManager CheckpointManager
@@ -112,13 +118,28 @@ type consensusRuntime struct {
 	// manager for state sync bridge transactions
 	stateSyncManager StateSyncManager
 
+	// manager for handling validator stake change and updating validator set
+	stakeManager StakeManager
+
+	eventProvider *EventProvider
+
+	// stateSyncRelayer is relayer for commitment events
+	stateSyncRelayer StateSyncRelayer
+
 	// logger instance
 	logger hcf.Logger
 }
 
 // newConsensusRuntime creates and starts a new consensus runtime instance with event tracking
 func newConsensusRuntime(log hcf.Logger, config *runtimeConfig) (*consensusRuntime, error) {
-	proposerCalculator, err := NewProposerCalculator(config, log.Named("proposer_calculator"))
+	dbTx, err := config.State.beginDBTransaction(true)
+	if err != nil {
+		return nil, fmt.Errorf("could not begin dbTx to init consensus runtime: %w", err)
+	}
+
+	defer dbTx.Rollback() //nolint:errcheck
+
+	proposerCalculator, err := NewProposerCalculator(config, log.Named("proposer_calculator"), dbTx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create consensus runtime, error while creating proposer calculator %w", err)
 	}
@@ -129,6 +150,7 @@ func newConsensusRuntime(log hcf.Logger, config *runtimeConfig) (*consensusRunti
 		lastBuiltBlock:     config.blockchain.CurrentHeader(),
 		proposerCalculator: proposerCalculator,
 		logger:             log.Named("consensus_runtime"),
+		eventProvider:      NewEventProvider(config.blockchain),
 	}
 
 	if err := runtime.initStateSyncManager(log); err != nil {
@@ -139,10 +161,22 @@ func newConsensusRuntime(log hcf.Logger, config *runtimeConfig) (*consensusRunti
 		return nil, err
 	}
 
+	if err := runtime.initStakeManager(log, dbTx); err != nil {
+		return nil, err
+	}
+
+	if err := runtime.initStateSyncRelayer(log); err != nil {
+		return nil, err
+	}
+
 	// we need to call restart epoch on runtime to initialize epoch state
-	runtime.epoch, err = runtime.restartEpoch(runtime.lastBuiltBlock)
+	runtime.epoch, err = runtime.restartEpoch(runtime.lastBuiltBlock, dbTx)
 	if err != nil {
 		return nil, fmt.Errorf("consensus runtime creation - restart epoch failed: %w", err)
+	}
+
+	if err := dbTx.Commit(); err != nil {
+		return nil, fmt.Errorf("could not commit db tx to init consensus runtime: %w", err)
 	}
 
 	return runtime, nil
@@ -150,6 +184,7 @@ func newConsensusRuntime(log hcf.Logger, config *runtimeConfig) (*consensusRunti
 
 // close is used to tear down allocated resources
 func (c *consensusRuntime) close() {
+	c.stateSyncRelayer.Close()
 	c.stateSyncManager.Close()
 }
 
@@ -157,25 +192,23 @@ func (c *consensusRuntime) close() {
 // if bridge is not enabled, then a dummy state sync manager will be used
 func (c *consensusRuntime) initStateSyncManager(logger hcf.Logger) error {
 	if c.IsBridgeEnabled() {
-		stateSenderAddr := c.config.PolyBFTConfig.Bridge.BridgeAddr
-		stateSyncManager, err := newStateSyncManager(
+		stateSenderAddr := c.config.PolyBFTConfig.Bridge.StateSenderAddr
+		stateSyncManager := newStateSyncManager(
 			logger.Named("state-sync-manager"),
 			c.config.State,
 			&stateSyncConfig{
-				key:                   c.config.Key,
-				stateSenderAddr:       stateSenderAddr,
-				stateSenderStartBlock: c.config.PolyBFTConfig.Bridge.EventTrackerStartBlocks[stateSenderAddr],
-				jsonrpcAddr:           c.config.PolyBFTConfig.Bridge.JSONRPCEndpoint,
-				dataDir:               c.config.DataDir,
-				topic:                 c.config.bridgeTopic,
-				maxCommitmentSize:     maxCommitmentSize,
-				numBlockConfirmations: c.config.numBlockConfirmations,
+				key:                      c.config.Key,
+				stateSenderAddr:          stateSenderAddr,
+				stateSenderStartBlock:    c.config.PolyBFTConfig.Bridge.EventTrackerStartBlocks[stateSenderAddr],
+				jsonrpcAddr:              c.config.PolyBFTConfig.Bridge.JSONRPCEndpoint,
+				dataDir:                  c.config.DataDir,
+				topic:                    c.config.bridgeTopic,
+				maxCommitmentSize:        maxCommitmentSize,
+				numBlockConfirmations:    c.config.numBlockConfirmations,
+				blockTrackerPollInterval: c.config.PolyBFTConfig.BlockTrackerPollInterval.Duration,
 			},
+			c,
 		)
-
-		if err != nil {
-			return err
-		}
 
 		c.stateSyncManager = stateSyncManager
 	} else {
@@ -190,7 +223,9 @@ func (c *consensusRuntime) initStateSyncManager(logger hcf.Logger) error {
 func (c *consensusRuntime) initCheckpointManager(logger hcf.Logger) error {
 	if c.IsBridgeEnabled() {
 		// enable checkpoint manager
-		txRelayer, err := txrelayer.NewTxRelayer(txrelayer.WithIPAddress(c.config.PolyBFTConfig.Bridge.JSONRPCEndpoint))
+		txRelayer, err := txrelayer.NewTxRelayer(
+			txrelayer.WithIPAddress(c.config.PolyBFTConfig.Bridge.JSONRPCEndpoint),
+			txrelayer.WithWriter(logger.StandardWriter(&hcf.StandardLoggerOptions{})))
 		if err != nil {
 			return err
 		}
@@ -198,7 +233,7 @@ func (c *consensusRuntime) initCheckpointManager(logger hcf.Logger) error {
 		c.checkpointManager = newCheckpointManager(
 			wallet.NewEcdsaSigner(c.config.Key),
 			defaultCheckpointsOffset,
-			c.config.PolyBFTConfig.Bridge.CheckpointAddr,
+			c.config.PolyBFTConfig.Bridge.CheckpointManagerAddr,
 			txRelayer,
 			c.config.blockchain,
 			c.config.polybftBackend,
@@ -208,7 +243,61 @@ func (c *consensusRuntime) initCheckpointManager(logger hcf.Logger) error {
 		c.checkpointManager = &dummyCheckpointManager{}
 	}
 
+	c.eventProvider.Subscribe(c.checkpointManager)
+
 	return nil
+}
+
+// initStateSyncRelayer initializes state sync relayer
+// if not enabled, then a dummy state sync relayer will be used
+func (c *consensusRuntime) initStateSyncRelayer(logger hcf.Logger) error {
+	if c.config.consensusConfig.IsRelayer {
+		txRelayer, err := getStateSyncTxRelayer(c.config.consensusConfig.RPCEndpoint, logger)
+		if err != nil {
+			return err
+		}
+
+		c.stateSyncRelayer = NewStateSyncRelayer(
+			txRelayer,
+			contracts.StateReceiverContract,
+			c.state.StateSyncStore,
+			c,
+			c.config.blockchain,
+			wallet.NewEcdsaSigner(c.config.Key),
+			nil,
+			logger.Named("state_sync_relayer"))
+	} else {
+		c.stateSyncRelayer = &dummyStateSyncRelayer{}
+	}
+
+	c.eventProvider.Subscribe(c.stateSyncRelayer)
+
+	return c.stateSyncRelayer.Init()
+}
+
+// initStakeManager initializes stake manager
+func (c *consensusRuntime) initStakeManager(logger hcf.Logger, dbTx *bolt.Tx) error {
+	rootRelayer, err := txrelayer.NewTxRelayer(txrelayer.WithIPAddress(c.config.PolyBFTConfig.Bridge.JSONRPCEndpoint))
+	if err != nil {
+		return err
+	}
+
+	c.stakeManager, err = newStakeManager(
+		logger.Named("stake-manager"),
+		c.state,
+		rootRelayer,
+		wallet.NewEcdsaSigner(c.config.Key),
+		contracts.ValidatorSetContract,
+		c.config.PolyBFTConfig.Bridge.CustomSupernetManagerAddr,
+		c.config.blockchain,
+		c.config.polybftBackend,
+		int(c.config.PolyBFTConfig.MaxValidatorSetSize),
+		dbTx,
+	)
+
+	c.eventProvider.Subscribe(c.stakeManager)
+
+	return err
 }
 
 // getGuardedData returns last build block, proposer snapshot and current epochMetadata in a thread-safe manner.
@@ -238,6 +327,8 @@ func (c *consensusRuntime) IsBridgeEnabled() bool {
 
 // OnBlockInserted is called whenever fsm or syncer inserts new block
 func (c *consensusRuntime) OnBlockInserted(fullBlock *types.FullBlock) {
+	startTime := time.Now().UTC()
+
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -258,39 +349,104 @@ func (c *consensusRuntime) OnBlockInserted(fullBlock *types.FullBlock) {
 	var (
 		epoch = c.epoch
 		err   error
-		//nolint:godox
-		// TODO - this will need to take inconsideration if slashing occurred (to be fixed in EVM-519)
+		// calculation of epoch and sprint end does not consider slashing currently
+
 		isEndOfEpoch = c.isFixedSizeOfEpochMet(fullBlock.Block.Header.Number, epoch)
 	)
 
-	postBlock := &PostBlockRequest{FullBlock: fullBlock, Epoch: epoch.Number, IsEpochEndingBlock: isEndOfEpoch}
+	// begin DB transaction
+	dbTx, err := c.state.beginDBTransaction(true)
+	if err != nil {
+		c.logger.Error("failed to begin db transaction on block finalization",
+			"block", fullBlock.Block.Number(), "err", err)
 
-	// handle commitment and proofs creation
-	if err := c.stateSyncManager.PostBlock(postBlock); err != nil {
-		c.logger.Error("failed to post block state sync", "err", err)
+		return
 	}
 
-	// handle exit events that happened in block
-	if err := c.checkpointManager.PostBlock(postBlock); err != nil {
-		c.logger.Error("failed to post block in checkpoint manager", "err", err)
+	defer dbTx.Rollback() //nolint:errcheck
+
+	lastProcessedEventsBlock, err := c.state.getLastProcessedEventsBlock(dbTx)
+	if err != nil {
+		c.logger.Error("failed to get last processed events block on block finalization",
+			"block", fullBlock.Block.Number(), "err", err)
+
+		return
+	}
+
+	if err := c.eventProvider.GetEventsFromBlocks(lastProcessedEventsBlock, fullBlock, dbTx); err != nil {
+		c.logger.Error("failed to process events on block finalization", "block", fullBlock.Block.Number(), "err", err)
+
+		return
+	}
+
+	postBlock := &PostBlockRequest{
+		FullBlock:          fullBlock,
+		Epoch:              epoch.Number,
+		IsEpochEndingBlock: isEndOfEpoch,
+		DBTx:               dbTx,
+	}
+
+	if err := c.stateSyncManager.PostBlock(postBlock); err != nil {
+		c.logger.Error("failed to post block state sync", "err", err)
+
+		return
 	}
 
 	// update proposer priorities
 	if err := c.proposerCalculator.PostBlock(postBlock); err != nil {
 		c.logger.Error("Could not update proposer calculator", "err", err)
+
+		return
+	}
+
+	// handle transfer events that happened in block
+	if err := c.stakeManager.PostBlock(postBlock); err != nil {
+		c.logger.Error("failed to post block in stake manager", "err", err)
+
+		return
+	}
+
+	// handle state sync relayer events that happened in block
+	if err := c.stateSyncRelayer.PostBlock(postBlock); err != nil {
+		c.logger.Error("post block callback failed in state sync relayer", "err", err)
 	}
 
 	if isEndOfEpoch {
-		if epoch, err = c.restartEpoch(fullBlock.Block.Header); err != nil {
+		if epoch, err = c.restartEpoch(fullBlock.Block.Header, dbTx); err != nil {
 			c.logger.Error("failed to restart epoch after block inserted", "error", err)
 
 			return
 		}
 	}
 
+	if err := c.state.insertLastProcessedEventsBlock(fullBlock.Block.Number(), dbTx); err != nil {
+		c.logger.Error("failed to update the last processed events block in db", "error", err)
+
+		return
+	}
+
+	// commit DB transaction
+	if err := dbTx.Commit(); err != nil {
+		c.logger.Error("failed to commit transaction on PostBlock",
+			"block", fullBlock.Block.Number(), "error", err)
+
+		return
+	}
+
 	// finally update runtime state (lastBuiltBlock, epoch, proposerSnapshot)
 	c.epoch = epoch
 	c.lastBuiltBlock = fullBlock.Block.Header
+
+	// we will do PostBlock on checkpoint manager at the end, because it only
+	// sends a checkpoint in a separate routine. It doesn't do any db operations
+	if err := c.checkpointManager.PostBlock(postBlock); err != nil {
+		c.logger.Error("failed to post block in checkpoint manager", "err", err)
+	}
+
+	endTime := time.Now().UTC()
+
+	c.logger.Debug("OnBlockInserted finished", "elapsedTime", endTime.Sub(startTime),
+		"epoch", epoch.Number, "block", fullBlock.Block.Number())
 }
 
 // FSM creates a new instance of fsm
@@ -310,7 +466,7 @@ func (c *consensusRuntime) FSM() error {
 		parent,
 		types.Address(c.config.Key.Address()),
 		c.config.txPool,
-		c.config.PolyBFTConfig.BlockTime,
+		c.config.PolyBFTConfig.BlockTime.Duration,
 		c.logger,
 	)
 
@@ -318,15 +474,12 @@ func (c *consensusRuntime) FSM() error {
 		return fmt.Errorf("cannot create block builder for fsm: %w", err)
 	}
 
-	//nolint:godox
-	// TODO - recognize slashing occurred (to be fixed in EVM-519)
-	slash := false
-
 	pendingBlockNumber := parent.Number + 1
-	isEndOfSprint := slash || c.isFixedSizeOfSprintMet(pendingBlockNumber, epoch)
-	isEndOfEpoch := slash || c.isFixedSizeOfEpochMet(pendingBlockNumber, epoch)
+	// calculation of epoch and sprint end does not consider slashing currently
+	isEndOfSprint := c.isFixedSizeOfSprintMet(pendingBlockNumber, epoch)
+	isEndOfEpoch := c.isFixedSizeOfEpochMet(pendingBlockNumber, epoch)
 
-	valSet := NewValidatorSet(epoch.Validators, c.logger)
+	valSet := validator.NewValidatorSet(epoch.Validators, c.logger)
 
 	exitRootHash, err := c.checkpointManager.BuildEventRoot(epoch.Number)
 	if err != nil {
@@ -349,7 +502,7 @@ func (c *consensusRuntime) FSM() error {
 	}
 
 	if isEndOfSprint {
-		commitment, err := c.stateSyncManager.Commitment()
+		commitment, err := c.stateSyncManager.Commitment(pendingBlockNumber)
 		if err != nil {
 			return err
 		}
@@ -358,9 +511,14 @@ func (c *consensusRuntime) FSM() error {
 	}
 
 	if isEndOfEpoch {
-		ff.commitEpochInput, err = c.calculateCommitEpochInput(parent, epoch)
+		ff.commitEpochInput, ff.distributeRewardsInput, err = c.calculateCommitEpochInput(parent, epoch)
 		if err != nil {
 			return fmt.Errorf("cannot calculate commit epoch info: %w", err)
+		}
+
+		ff.newValidatorsDelta, err = c.stakeManager.UpdateValidatorSet(epoch.Number, epoch.Validators.Copy())
+		if err != nil {
+			return fmt.Errorf("cannot update validator set on epoch ending: %w", err)
 		}
 	}
 
@@ -380,7 +538,7 @@ func (c *consensusRuntime) FSM() error {
 
 // restartEpoch resets the previously run epoch and moves to the next one
 // returns *epochMetadata different from nil if the lastEpoch is not the current one and everything was successful
-func (c *consensusRuntime) restartEpoch(header *types.Header) (*epochMetadata, error) {
+func (c *consensusRuntime) restartEpoch(header *types.Header, dbTx *bolt.Tx) (*epochMetadata, error) {
 	lastEpoch := c.epoch
 
 	systemState, err := c.getSystemState(header)
@@ -401,7 +559,7 @@ func (c *consensusRuntime) restartEpoch(header *types.Header) (*epochMetadata, e
 		}
 	}
 
-	validatorSet, err := c.config.polybftBackend.GetValidators(header.Number, nil)
+	validatorSet, err := c.config.polybftBackend.GetValidatorsWithTx(header.Number, nil, dbTx)
 	if err != nil {
 		return nil, fmt.Errorf("restart epoch - cannot get validators: %w", err)
 	}
@@ -416,11 +574,11 @@ func (c *consensusRuntime) restartEpoch(header *types.Header) (*epochMetadata, e
 		return nil, err
 	}
 
-	if err := c.state.EpochStore.cleanEpochsFromDB(); err != nil {
+	if err := c.state.EpochStore.cleanEpochsFromDB(dbTx); err != nil {
 		c.logger.Error("Could not clean previous epochs from db.", "error", err)
 	}
 
-	if err := c.state.EpochStore.insertEpoch(epochNumber); err != nil {
+	if err := c.state.EpochStore.insertEpoch(epochNumber, dbTx); err != nil {
 		return nil, fmt.Errorf("an error occurred while inserting new epoch in db. Reason: %w", err)
 	}
 
@@ -436,7 +594,8 @@ func (c *consensusRuntime) restartEpoch(header *types.Header) (*epochMetadata, e
 		SystemState:       systemState,
 		NewEpochID:        epochNumber,
 		FirstBlockOfEpoch: firstBlockInEpoch,
-		ValidatorSet:      NewValidatorSet(validatorSet, c.logger),
+		ValidatorSet:      validator.NewValidatorSet(validatorSet, c.logger),
+		DBTx:              dbTx,
 	}
 
 	if err := c.stateSyncManager.PostEpoch(reqObj); err != nil {
@@ -454,13 +613,15 @@ func (c *consensusRuntime) restartEpoch(header *types.Header) (*epochMetadata, e
 // in the current epoch, and ending at the last block of previous epoch
 func (c *consensusRuntime) calculateCommitEpochInput(
 	currentBlock *types.Header,
-	epoch *epochMetadata) (*contractsapi.CommitEpochChildValidatorSetFn, error) {
+	epoch *epochMetadata,
+) (*contractsapi.CommitEpochValidatorSetFn,
+	*contractsapi.DistributeRewardForRewardPoolFn, error) {
 	uptimeCounter := map[types.Address]int64{}
 	blockHeader := currentBlock
 	epochID := epoch.Number
 	totalBlocks := int64(0)
 
-	getSealersForBlock := func(blockExtra *Extra, validators AccountSet) error {
+	getSealersForBlock := func(blockExtra *Extra, validators validator.AccountSet) error {
 		signers, err := validators.GetFilteredValidators(blockExtra.Parent.Bitmap)
 		if err != nil {
 			return err
@@ -477,18 +638,18 @@ func (c *consensusRuntime) calculateCommitEpochInput(
 
 	blockExtra, err := GetIbftExtra(currentBlock.ExtraData)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// calculate uptime for current epoch
 	for blockHeader.Number > epoch.FirstBlockInEpoch {
 		if err := getSealersForBlock(blockExtra, epoch.Validators); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		blockHeader, blockExtra, err = getBlockData(blockHeader.Number-1, c.config.blockchain)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -498,23 +659,18 @@ func (c *consensusRuntime) calculateCommitEpochInput(
 		for i := 0; i < commitEpochLookbackSize; i++ {
 			validators, err := c.config.polybftBackend.GetValidators(blockHeader.Number-2, nil)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 
 			if err := getSealersForBlock(blockExtra, validators); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 
 			blockHeader, blockExtra, err = getBlockData(blockHeader.Number-1, c.config.blockchain)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
-	}
-
-	uptime := &contractsapi.Uptime{
-		EpochID:     new(big.Int).SetUint64(epochID),
-		TotalBlocks: big.NewInt(totalBlocks),
 	}
 
 	// include the data in the uptime counter in a deterministic way
@@ -524,25 +680,34 @@ func (c *consensusRuntime) calculateCommitEpochInput(
 		addrSet = append(addrSet, addr)
 	}
 
+	uptime := make([]*contractsapi.Uptime, len(addrSet))
+
 	sort.Slice(addrSet, func(i, j int) bool {
 		return bytes.Compare(addrSet[i][:], addrSet[j][:]) > 0
 	})
 
-	for _, addr := range addrSet {
-		uptime.AddValidatorUptime(addr, uptimeCounter[addr])
+	for i, addr := range addrSet {
+		uptime[i] = &contractsapi.Uptime{
+			Validator:    addr,
+			SignedBlocks: new(big.Int).SetInt64(uptimeCounter[addr]),
+		}
 	}
 
-	commitEpoch := &contractsapi.CommitEpochChildValidatorSetFn{
+	commitEpoch := &contractsapi.CommitEpochValidatorSetFn{
 		ID: new(big.Int).SetUint64(epochID),
 		Epoch: &contractsapi.Epoch{
 			StartBlock: new(big.Int).SetUint64(epoch.FirstBlockInEpoch),
 			EndBlock:   new(big.Int).SetUint64(currentBlock.Number + 1),
 			EpochRoot:  types.Hash{},
 		},
-		Uptime: uptime,
 	}
 
-	return commitEpoch, nil
+	distributeRewards := &contractsapi.DistributeRewardForRewardPoolFn{
+		EpochID: new(big.Int).SetUint64(epochID),
+		Uptime:  uptime,
+	}
+
+	return commitEpoch, distributeRewards, nil
 }
 
 // GenerateExitProof generates proof of exit and is a bridge endpoint store function
@@ -557,16 +722,12 @@ func (c *consensusRuntime) GetStateSyncProof(stateSyncID uint64) (types.Proof, e
 
 // setIsActiveValidator updates the activeValidatorFlag field
 func (c *consensusRuntime) setIsActiveValidator(isActiveValidator bool) {
-	if isActiveValidator {
-		atomic.StoreUint32(&c.activeValidatorFlag, 1)
-	} else {
-		atomic.StoreUint32(&c.activeValidatorFlag, 0)
-	}
+	c.activeValidatorFlag.Store(isActiveValidator)
 }
 
 // isActiveValidator indicates if node is in validator set or not
-func (c *consensusRuntime) isActiveValidator() bool {
-	return atomic.LoadUint32(&c.activeValidatorFlag) == 1
+func (c *consensusRuntime) IsActiveValidator() bool {
+	return c.activeValidatorFlag.Load()
 }
 
 // isFixedSizeOfEpochMet checks if epoch reached its end that was configured by its default size
@@ -721,61 +882,19 @@ func (c *consensusRuntime) ID() []byte {
 	return c.config.Key.Address().Bytes()
 }
 
-// HasQuorum returns true if quorum is reached for the given blockNumber
-func (c *consensusRuntime) HasQuorum(
-	height uint64,
-	messages []*proto.Message,
-	msgType proto.MessageType) bool {
+// GetVotingPowers returns map of validators addresses and their voting powers for the specified height.
+func (c *consensusRuntime) GetVotingPowers(height uint64) (map[string]*big.Int, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
-	// extract the addresses of all the signers of the messages
-	ppIncluded := false
-	signers := make(map[types.Address]struct{}, len(messages))
 
-	for _, message := range messages {
-		if message.Type == proto.MessageType_PREPREPARE {
-			ppIncluded = true
-		}
-
-		signers[types.BytesToAddress(message.From)] = struct{}{}
+	if c.fsm == nil {
+		return nil, errors.New("getting voting power failed - backend is not initialized")
+	} else if c.fsm.Height() != height {
+		return nil, fmt.Errorf("getting voting power failed - backend is not initialized for height %d, fsm height %d",
+			height, c.fsm.Height())
 	}
 
-	// check quorum
-	switch msgType {
-	case proto.MessageType_PREPREPARE:
-		return len(messages) >= 1
-	case proto.MessageType_PREPARE:
-		if ppIncluded {
-			return c.fsm.validators.HasQuorum(signers)
-		}
-
-		if len(messages) == 0 {
-			return false
-		}
-
-		propAddress, err := c.fsm.proposerSnapshot.GetLatestProposer(messages[0].View.Round, height)
-		if err != nil {
-			// This can happen if e.g. node runs sequence on lower height and proposer calculator updated
-			// to a newer count as a consequence of inserting block from syncer
-			c.logger.Debug("HasQuorum has been called but proposer could not be retrieved", "error", err)
-
-			return false
-		}
-
-		if _, ok := signers[propAddress]; ok {
-			c.logger.Warn("HasQuorum failed - proposer is among signers but it is not expected to be")
-
-			return false
-		}
-
-		signers[propAddress] = struct{}{} // add proposer manually
-
-		return c.fsm.validators.HasQuorum(signers)
-	case proto.MessageType_ROUND_CHANGE, proto.MessageType_COMMIT:
-		return c.fsm.validators.HasQuorum(signers)
-	default:
-		return false
-	}
+	return c.fsm.validators.GetVotingPowers(), nil
 }
 
 // BuildPrePrepareMessage builds a PREPREPARE message based on the passed in proposal
@@ -864,7 +983,7 @@ func (c *consensusRuntime) BuildPrepareMessage(proposalHash []byte, view *proto.
 
 // BuildCommitMessage builds a COMMIT message based on the passed in proposal
 func (c *consensusRuntime) BuildCommitMessage(proposalHash []byte, view *proto.View) *proto.Message {
-	committedSeal, err := c.config.Key.SignWithDomain(proposalHash, bls.DomainCheckpointManager)
+	committedSeal, err := c.config.Key.SignWithDomain(proposalHash, signer.DomainCheckpointManager)
 	if err != nil {
 		c.logger.Error("Cannot create committed seal message.", "error", err)
 
@@ -958,7 +1077,7 @@ func (c *consensusRuntime) getFirstBlockOfEpoch(epochNumber uint64, latestHeader
 
 // getSealersForBlock checks who sealed a given block and updates the counter
 func getSealersForBlock(sealersCounter map[types.Address]uint64,
-	blockExtra *Extra, validators AccountSet) error {
+	blockExtra *Extra, validators validator.AccountSet) error {
 	signers, err := validators.GetFilteredValidators(blockExtra.Parent.Bitmap)
 	if err != nil {
 		return err

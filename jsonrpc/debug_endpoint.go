@@ -8,9 +8,12 @@ import (
 
 	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/state/runtime/tracer"
+	"github.com/0xPolygon/polygon-edge/state/runtime/tracer/calltracer"
 	"github.com/0xPolygon/polygon-edge/state/runtime/tracer/structtracer"
 	"github.com/0xPolygon/polygon-edge/types"
 )
+
+const callTracerName = "callTracer"
 
 var (
 	defaultTraceTimeout = 5 * time.Second
@@ -65,84 +68,114 @@ type debugStore interface {
 
 // Debug is the debug jsonrpc endpoint
 type Debug struct {
-	store debugStore
+	store      debugStore
+	throttling *Throttling
+}
+
+func NewDebug(store debugStore, requestsPerSecond uint64) *Debug {
+	return &Debug{
+		store:      store,
+		throttling: NewThrottling(requestsPerSecond, time.Second),
+	}
 }
 
 type TraceConfig struct {
-	EnableMemory     bool    `json:"enableMemory"`
-	DisableStack     bool    `json:"disableStack"`
-	DisableStorage   bool    `json:"disableStorage"`
-	EnableReturnData bool    `json:"enableReturnData"`
-	Timeout          *string `json:"timeout"`
+	EnableMemory      bool    `json:"enableMemory"`
+	DisableStack      bool    `json:"disableStack"`
+	DisableStorage    bool    `json:"disableStorage"`
+	EnableReturnData  bool    `json:"enableReturnData"`
+	DisableStructLogs bool    `json:"disableStructLogs"`
+	Timeout           *string `json:"timeout"`
+	Tracer            string  `json:"tracer"`
 }
 
 func (d *Debug) TraceBlockByNumber(
 	blockNumber BlockNumber,
 	config *TraceConfig,
 ) (interface{}, error) {
-	num, err := GetNumericBlockNumber(blockNumber, d.store)
-	if err != nil {
-		return nil, err
-	}
+	return d.throttling.AttemptRequest(
+		context.Background(),
+		func() (interface{}, error) {
+			num, err := GetNumericBlockNumber(blockNumber, d.store)
+			if err != nil {
+				return nil, err
+			}
 
-	block, ok := d.store.GetBlockByNumber(num, true)
-	if !ok {
-		return nil, fmt.Errorf("block %d not found", num)
-	}
+			block, ok := d.store.GetBlockByNumber(num, true)
+			if !ok {
+				return nil, fmt.Errorf("block %d not found", num)
+			}
 
-	return d.traceBlock(block, config)
+			return d.traceBlock(block, config)
+		},
+	)
 }
 
 func (d *Debug) TraceBlockByHash(
 	blockHash types.Hash,
 	config *TraceConfig,
 ) (interface{}, error) {
-	block, ok := d.store.GetBlockByHash(blockHash, true)
-	if !ok {
-		return nil, fmt.Errorf("block %s not found", blockHash)
-	}
+	return d.throttling.AttemptRequest(
+		context.Background(),
+		func() (interface{}, error) {
+			block, ok := d.store.GetBlockByHash(blockHash, true)
+			if !ok {
+				return nil, fmt.Errorf("block %s not found", blockHash)
+			}
 
-	return d.traceBlock(block, config)
+			return d.traceBlock(block, config)
+		},
+	)
 }
 
 func (d *Debug) TraceBlock(
 	input string,
 	config *TraceConfig,
 ) (interface{}, error) {
-	blockByte, decodeErr := hex.DecodeHex(input)
-	if decodeErr != nil {
-		return nil, fmt.Errorf("unable to decode block, %w", decodeErr)
-	}
+	return d.throttling.AttemptRequest(
+		context.Background(),
+		func() (interface{}, error) {
+			blockByte, decodeErr := hex.DecodeHex(input)
+			if decodeErr != nil {
+				return nil, fmt.Errorf("unable to decode block, %w", decodeErr)
+			}
 
-	block := &types.Block{}
-	if err := block.UnmarshalRLP(blockByte); err != nil {
-		return nil, err
-	}
+			block := &types.Block{}
+			if err := block.UnmarshalRLP(blockByte); err != nil {
+				return nil, err
+			}
 
-	return d.traceBlock(block, config)
+			return d.traceBlock(block, config)
+		},
+	)
 }
 
 func (d *Debug) TraceTransaction(
 	txHash types.Hash,
 	config *TraceConfig,
 ) (interface{}, error) {
-	tx, block := GetTxAndBlockByTxHash(txHash, d.store)
-	if tx == nil {
-		return nil, fmt.Errorf("tx %s not found", txHash.String())
-	}
+	return d.throttling.AttemptRequest(
+		context.Background(),
+		func() (interface{}, error) {
+			tx, block := GetTxAndBlockByTxHash(txHash, d.store)
+			if tx == nil {
+				return nil, fmt.Errorf("tx %s not found", txHash.String())
+			}
 
-	if block.Number() == 0 {
-		return nil, ErrTraceGenesisBlock
-	}
+			if block.Number() == 0 {
+				return nil, ErrTraceGenesisBlock
+			}
 
-	tracer, cancel, err := newTracer(config)
-	if err != nil {
-		return nil, err
-	}
+			tracer, cancel, err := newTracer(config)
+			if err != nil {
+				return nil, err
+			}
 
-	defer cancel()
+			defer cancel()
 
-	return d.store.TraceTxn(block, tx.Hash, tracer)
+			return d.store.TraceTxn(block, tx.Hash, tracer)
+		},
+	)
 }
 
 func (d *Debug) TraceCall(
@@ -150,29 +183,34 @@ func (d *Debug) TraceCall(
 	filter BlockNumberOrHash,
 	config *TraceConfig,
 ) (interface{}, error) {
-	header, err := GetHeaderFromBlockNumberOrHash(filter, d.store)
-	if err != nil {
-		return nil, ErrHeaderNotFound
-	}
+	return d.throttling.AttemptRequest(
+		context.Background(),
+		func() (interface{}, error) {
+			header, err := GetHeaderFromBlockNumberOrHash(filter, d.store)
+			if err != nil {
+				return nil, ErrHeaderNotFound
+			}
 
-	tx, err := DecodeTxn(arg, d.store)
-	if err != nil {
-		return nil, err
-	}
+			tx, err := DecodeTxn(arg, header.Number, d.store, true)
+			if err != nil {
+				return nil, err
+			}
 
-	// If the caller didn't supply the gas limit in the message, then we set it to maximum possible => block gas limit
-	if tx.Gas == 0 {
-		tx.Gas = header.GasLimit
-	}
+			// If the caller didn't supply the gas limit in the message, then we set it to maximum possible => block gas limit
+			if tx.Gas == 0 {
+				tx.Gas = header.GasLimit
+			}
 
-	tracer, cancel, err := newTracer(config)
-	defer cancel()
+			tracer, cancel, err := newTracer(config)
+			if err != nil {
+				return nil, err
+			}
 
-	if err != nil {
-		return nil, err
-	}
+			defer cancel()
 
-	return d.store.TraceCall(tx, header, tracer)
+			return d.store.TraceCall(tx, header, tracer)
+		},
+	)
 }
 
 func (d *Debug) traceBlock(
@@ -184,11 +222,11 @@ func (d *Debug) traceBlock(
 	}
 
 	tracer, cancel, err := newTracer(config)
-	defer cancel()
-
 	if err != nil {
 		return nil, err
 	}
+
+	defer cancel()
 
 	return d.store.TraceBlock(block, tracer)
 }
@@ -214,12 +252,19 @@ func newTracer(config *TraceConfig) (
 		}
 	}
 
-	tracer := structtracer.NewStructTracer(structtracer.Config{
-		EnableMemory:     config.EnableMemory,
-		EnableStack:      !config.DisableStack,
-		EnableStorage:    !config.DisableStorage,
-		EnableReturnData: config.EnableReturnData,
-	})
+	var tracer tracer.Tracer
+
+	if config.Tracer == callTracerName {
+		tracer = &calltracer.CallTracer{}
+	} else {
+		tracer = structtracer.NewStructTracer(structtracer.Config{
+			EnableMemory:     config.EnableMemory && !config.DisableStructLogs,
+			EnableStack:      !config.DisableStack && !config.DisableStructLogs,
+			EnableStorage:    !config.DisableStorage && !config.DisableStructLogs,
+			EnableReturnData: config.EnableReturnData,
+			EnableStructLogs: !config.DisableStructLogs,
+		})
+	}
 
 	timeoutCtx, cancel := context.WithTimeout(context.Background(), timeout)
 

@@ -3,6 +3,7 @@ package consensus
 import (
 	"context"
 	"log"
+	"time"
 
 	"github.com/0xPolygon/polygon-edge/blockchain"
 	"github.com/0xPolygon/polygon-edge/chain"
@@ -29,13 +30,16 @@ type Consensus interface {
 	GetBlockCreator(header *types.Header) (types.Address, error)
 
 	// PreCommitState a hook to be called before finalizing state transition on inserting block
-	PreCommitState(header *types.Header, txn *state.Transition) error
+	PreCommitState(block *types.Block, txn *state.Transition) error
 
 	// GetSyncProgression retrieves the current sync progression, if any
 	GetSyncProgression() *progress.Progression
 
 	// GetBridgeProvider returns an instance of BridgeDataProvider
 	GetBridgeProvider() BridgeDataProvider
+
+	// FilterExtra filters extra data in header that is not a part of block hash
+	FilterExtra(extra []byte) ([]byte, error)
 
 	// Initialize initializes the consensus (e.g. setup data)
 	Initialize() error
@@ -60,6 +64,12 @@ type Config struct {
 
 	// Path is the directory path for the consensus protocol to store information
 	Path string
+
+	// IsRelayer is true if node is relayer
+	IsRelayer bool
+
+	// RPCEndpoint
+	RPCEndpoint string
 }
 
 type Params struct {
@@ -75,6 +85,7 @@ type Params struct {
 	BlockTime      uint64
 
 	NumBlockConfirmations uint64
+	MetricsInterval       time.Duration
 }
 
 // Factory is the factory function to create a discovery consensus

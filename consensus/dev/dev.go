@@ -120,7 +120,7 @@ func (d *Dev) writeTransactions(gasLimit uint64, transition transitionInterface)
 			break
 		}
 
-		if tx.ExceedsBlockGasLimit(gasLimit) {
+		if tx.Gas > gasLimit {
 			d.txpool.Drop(tx)
 
 			continue
@@ -168,6 +168,7 @@ func (d *Dev) writeNewBlock(parent *types.Header) error {
 	}
 
 	header.GasLimit = gasLimit
+	header.BaseFee = d.blockchain.CalculateBaseFee(parent)
 
 	miner, err := d.GetBlockCreator(header)
 	if err != nil {
@@ -183,7 +184,10 @@ func (d *Dev) writeNewBlock(parent *types.Header) error {
 	txns := d.writeTransactions(gasLimit, transition)
 
 	// Commit the changes
-	_, root := transition.Commit()
+	_, root, err := transition.Commit()
+	if err != nil {
+		return fmt.Errorf("failed to commit the state changes: %w", err)
+	}
 
 	// Update the header
 	header.StateRoot = root
@@ -229,7 +233,7 @@ func (d *Dev) GetBlockCreator(header *types.Header) (types.Address, error) {
 }
 
 // PreCommitState a hook to be called before finalizing state transition on inserting block
-func (d *Dev) PreCommitState(_header *types.Header, _txn *state.Transition) error {
+func (d *Dev) PreCommitState(_ *types.Block, _ *state.Transition) error {
 	return nil
 }
 
@@ -245,4 +249,8 @@ func (d *Dev) Close() error {
 
 func (d *Dev) GetBridgeProvider() consensus.BridgeDataProvider {
 	return nil
+}
+
+func (d *Dev) FilterExtra(extra []byte) ([]byte, error) {
+	return extra, nil
 }

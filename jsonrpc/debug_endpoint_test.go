@@ -6,10 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/state/runtime/tracer"
+	"github.com/0xPolygon/polygon-edge/state/runtime/tracer/structtracer"
 	"github.com/0xPolygon/polygon-edge/types"
-	"github.com/stretchr/testify/assert"
 )
 
 type debugEndpointMockStore struct {
@@ -154,6 +157,20 @@ func TestDebugTraceConfigDecode(t *testing.T) {
 				Timeout:          &timeout15s,
 			},
 		},
+		{
+			input: `{
+				"disableStack": true,
+				"disableStorage": true,
+				"enableReturnData": true,
+				"disableStructLogs": true
+			}`,
+			expected: TraceConfig{
+				DisableStack:      true,
+				DisableStorage:    true,
+				EnableReturnData:  true,
+				DisableStructLogs: true,
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -269,7 +286,7 @@ func TestTraceBlockByNumber(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			endpoint := &Debug{test.store}
+			endpoint := NewDebug(test.store, 100000)
 
 			res, err := endpoint.TraceBlockByNumber(test.blockNumber, test.config)
 
@@ -338,7 +355,7 @@ func TestTraceBlockByHash(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			endpoint := &Debug{test.store}
+			endpoint := NewDebug(test.store, 100000)
 
 			res, err := endpoint.TraceBlockByHash(test.blockHash, test.config)
 
@@ -397,7 +414,7 @@ func TestTraceBlock(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			endpoint := &Debug{test.store}
+			endpoint := NewDebug(test.store, 100000)
 
 			res, err := endpoint.TraceBlock(test.input, test.config)
 
@@ -543,7 +560,7 @@ func TestTraceTransaction(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			endpoint := &Debug{test.store}
+			endpoint := NewDebug(test.store, 100000)
 
 			res, err := endpoint.TraceTransaction(test.txHash, test.config)
 
@@ -562,39 +579,45 @@ func TestTraceCall(t *testing.T) {
 	t.Parallel()
 
 	var (
-		from     = types.StringToAddress("1")
-		to       = types.StringToAddress("2")
-		gas      = argUint64(10000)
-		gasPrice = argBytes(new(big.Int).SetUint64(10).Bytes())
-		value    = argBytes(new(big.Int).SetUint64(1000).Bytes())
-		data     = argBytes([]byte("data"))
-		input    = argBytes([]byte("input"))
-		nonce    = argUint64(1)
+		from      = types.StringToAddress("1")
+		to        = types.StringToAddress("2")
+		gas       = argUint64(10000)
+		gasPrice  = argBytes(new(big.Int).SetUint64(10).Bytes())
+		gasTipCap = argBytes(new(big.Int).SetUint64(10).Bytes())
+		gasFeeCap = argBytes(new(big.Int).SetUint64(10).Bytes())
+		value     = argBytes(new(big.Int).SetUint64(1000).Bytes())
+		data      = argBytes([]byte("data"))
+		input     = argBytes([]byte("input"))
+		nonce     = argUint64(1)
 
 		blockNumber = BlockNumber(testBlock10.Number())
 
 		txArg = &txnArgs{
-			From:     &from,
-			To:       &to,
-			Gas:      &gas,
-			GasPrice: &gasPrice,
-			Value:    &value,
-			Data:     &data,
-			Input:    &input,
-			Nonce:    &nonce,
+			From:      &from,
+			To:        &to,
+			Gas:       &gas,
+			GasPrice:  &gasPrice,
+			GasTipCap: &gasTipCap,
+			GasFeeCap: &gasFeeCap,
+			Value:     &value,
+			Data:      &data,
+			Input:     &input,
+			Nonce:     &nonce,
 		}
 		decodedTx = &types.Transaction{
-			Nonce:    uint64(nonce),
-			GasPrice: new(big.Int).SetBytes([]byte(gasPrice)),
-			Gas:      uint64(gas),
-			To:       &to,
-			Value:    new(big.Int).SetBytes([]byte(value)),
-			Input:    data,
-			From:     from,
+			Nonce:     uint64(nonce),
+			GasPrice:  new(big.Int).SetBytes([]byte(gasPrice)),
+			GasTipCap: new(big.Int).SetBytes([]byte(gasTipCap)),
+			GasFeeCap: new(big.Int).SetBytes([]byte(gasFeeCap)),
+			Gas:       uint64(gas),
+			To:        &to,
+			Value:     new(big.Int).SetBytes([]byte(value)),
+			Input:     data,
+			From:      from,
 		}
 	)
 
-	decodedTx.ComputeHash()
+	decodedTx.ComputeHash(1)
 
 	tests := []struct {
 		name   string
@@ -624,6 +647,12 @@ func TestTraceCall(t *testing.T) {
 
 					return testTraceResult, nil
 				},
+				headerFn: func() *types.Header {
+					return testLatestHeader
+				},
+				getAccountFn: func(h types.Hash, a types.Address) (*Account, error) {
+					return &Account{Nonce: 1}, nil
+				},
 			},
 			result: testTraceResult,
 			err:    false,
@@ -641,6 +670,12 @@ func TestTraceCall(t *testing.T) {
 					assert.False(t, full)
 
 					return nil, false
+				},
+				headerFn: func() *types.Header {
+					return testLatestHeader
+				},
+				getAccountFn: func(h types.Hash, a types.Address) (*Account, error) {
+					return &Account{Nonce: 1}, nil
 				},
 			},
 			result: nil,
@@ -661,6 +696,9 @@ func TestTraceCall(t *testing.T) {
 				headerFn: func() *types.Header {
 					return testLatestHeader
 				},
+				getAccountFn: func(h types.Hash, a types.Address) (*Account, error) {
+					return &Account{Nonce: 1}, nil
+				},
 			},
 			result: nil,
 			err:    true,
@@ -673,7 +711,7 @@ func TestTraceCall(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			endpoint := &Debug{test.store}
+			endpoint := NewDebug(test.store, 100000)
 
 			res, err := endpoint.TraceCall(test.arg, test.filter, test.config)
 
@@ -765,5 +803,34 @@ func Test_newTracer(t *testing.T) {
 
 		assert.NotNil(t, res)
 		assert.NoError(t, err)
+	})
+
+	t.Run("should disable everything if struct logs are disabled", func(t *testing.T) {
+		t.Parallel()
+
+		tracer, cancel, err := newTracer(&TraceConfig{
+			EnableMemory:      true,
+			EnableReturnData:  true,
+			DisableStack:      false,
+			DisableStorage:    false,
+			DisableStructLogs: true,
+		})
+
+		t.Cleanup(func() {
+			cancel()
+		})
+
+		assert.NoError(t, err)
+
+		st, ok := tracer.(*structtracer.StructTracer)
+		require.True(t, ok)
+
+		assert.Equal(t, structtracer.Config{
+			EnableMemory:     false,
+			EnableStack:      false,
+			EnableStorage:    false,
+			EnableReturnData: true,
+			EnableStructLogs: false,
+		}, st.Config)
 	})
 }

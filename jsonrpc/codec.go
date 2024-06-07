@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/types"
 )
 
@@ -14,6 +15,8 @@ type Request struct {
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params,omitempty"`
 }
+
+type BatchRequest []Request
 
 // Response is a jsonrpc response interface
 type Response interface {
@@ -93,6 +96,25 @@ func (e *ObjectError) Error() string {
 	return string(data)
 }
 
+func (e *ObjectError) MarshalJSON() ([]byte, error) {
+	var ds string
+
+	data, ok := e.Data.([]byte)
+	if ok && len(data) > 0 {
+		ds = "0x" + string(data)
+	}
+
+	return json.Marshal(&struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    string `json:"data,omitempty"`
+	}{
+		Code:    e.Code,
+		Message: e.Message,
+		Data:    ds,
+	})
+}
+
 const (
 	pending  = "pending"
 	latest   = "latest"
@@ -147,6 +169,21 @@ func (bnh *BlockNumberOrHash) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// stringToBlockNumberSafe parses string and returns Block Number
+// works similar to stringToBlockNumber
+// but treats empty string or pending block number as a latest
+func stringToBlockNumberSafe(str string) (BlockNumber, error) {
+	switch str {
+	case "", pending:
+		return LatestBlockNumber, nil
+	default:
+		return stringToBlockNumber(str)
+	}
+}
+
+// stringToBlockNumber parses string and returns Block Number
+// empty string is treated as an error
+// pending blocks are allowed
 func stringToBlockNumber(str string) (BlockNumber, error) {
 	if str == "" {
 		return 0, fmt.Errorf("value is empty")
@@ -154,13 +191,15 @@ func stringToBlockNumber(str string) (BlockNumber, error) {
 
 	str = strings.Trim(str, "\"")
 	switch str {
-	case pending, latest:
+	case pending:
+		return PendingBlockNumber, nil
+	case latest:
 		return LatestBlockNumber, nil
 	case earliest:
 		return EarliestBlockNumber, nil
 	}
 
-	n, err := types.ParseUint64orHex(&str)
+	n, err := common.ParseUint64orHex(&str)
 	if err != nil {
 		return 0, err
 	}
@@ -190,8 +229,8 @@ func (b *BlockNumber) UnmarshalJSON(buffer []byte) error {
 }
 
 // NewRPCErrorResponse is used to create a custom error response
-func NewRPCErrorResponse(id interface{}, errCode int, err string, jsonrpcver string) Response {
-	errObject := &ObjectError{errCode, err, nil}
+func NewRPCErrorResponse(id interface{}, errCode int, err string, data []byte, jsonrpcver string) Response {
+	errObject := &ObjectError{errCode, err, data}
 
 	response := &ErrorResponse{
 		JSONRPC: jsonrpcver,
@@ -209,7 +248,7 @@ func NewRPCResponse(id interface{}, jsonrpcver string, reply []byte, err Error) 
 	case nil:
 		response = &SuccessResponse{JSONRPC: jsonrpcver, ID: id, Result: reply}
 	default:
-		response = NewRPCErrorResponse(id, err.ErrorCode(), err.Error(), jsonrpcver)
+		response = NewRPCErrorResponse(id, err.ErrorCode(), err.Error(), reply, jsonrpcver)
 	}
 
 	return response

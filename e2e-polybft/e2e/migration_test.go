@@ -11,17 +11,17 @@ import (
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/contractsapi"
 	frameworkpolybft "github.com/0xPolygon/polygon-edge/e2e-polybft/framework"
 	"github.com/0xPolygon/polygon-edge/e2e/framework"
+	"github.com/0xPolygon/polygon-edge/helper/common"
 	itrie "github.com/0xPolygon/polygon-edge/state/immutable-trie"
 	"github.com/0xPolygon/polygon-edge/txrelayer"
 	"github.com/0xPolygon/polygon-edge/types"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/umbracle/ethgo"
 	"github.com/umbracle/ethgo/wallet"
 )
 
-func TestMigration(t *testing.T) {
+func TestE2E_Migration(t *testing.T) {
 	userKey, _ := wallet.GenerateKey()
 	userAddr := userKey.Address()
 	userKey2, _ := wallet.GenerateKey()
@@ -41,14 +41,14 @@ func TestMigration(t *testing.T) {
 		userAddr,
 		ethgo.Latest,
 	)
-	assert.NoError(t, err)
-	assert.Equal(t, balanceSender.Cmp(initialBalance), 0)
+	require.NoError(t, err)
+	require.Equal(t, balanceSender.Cmp(initialBalance), 0)
 
 	balanceReceiver, err := rpcClient.Eth().GetBalance(
 		userAddr2,
 		ethgo.Latest,
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	if balanceReceiver.Uint64() != 0 {
 		t.Fatal("balanceReceiver is not 0")
@@ -62,17 +62,17 @@ func TestMigration(t *testing.T) {
 	receipt, err := relayer.SendTransaction(&ethgo.Transaction{
 		From:     userAddr,
 		To:       &userAddr2,
-		GasPrice: 1048576,
 		Gas:      1000000,
 		Value:    sendAmount,
+		GasPrice: ethgo.Gwei(2).Uint64(),
 	}, userKey)
-	assert.NoError(t, err)
-	assert.NotNil(t, receipt)
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
 
 	receipt, err = relayer.SendTransaction(&ethgo.Transaction{
 		From:     userAddr,
-		GasPrice: 1048576,
 		Gas:      1000000,
+		GasPrice: ethgo.Gwei(2).Uint64(),
 		Input:    contractsapi.TestWriteBlockMetadata.Bytecode,
 	}, userKey)
 	require.NoError(t, err)
@@ -93,14 +93,14 @@ func TestMigration(t *testing.T) {
 		userAddr,
 		ethgo.Latest,
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	balanceReceiver, err = rpcClient.Eth().GetBalance(
 		userAddr2,
 		ethgo.Latest,
 	)
-	assert.NoError(t, err)
-	assert.Equal(t, sendAmount, balanceReceiver)
+	require.NoError(t, err)
+	require.Equal(t, sendAmount, balanceReceiver)
 
 	block, err := rpcClient.Eth().GetBlockByNumber(ethgo.Latest, true)
 	if err != nil {
@@ -149,6 +149,7 @@ func TestMigration(t *testing.T) {
 	cluster := frameworkpolybft.NewTestCluster(t, 7,
 		frameworkpolybft.WithNonValidators(2),
 		frameworkpolybft.WithValidatorSnapshot(5),
+		frameworkpolybft.WithTestRewardToken(),
 		frameworkpolybft.WithGenesisState(tmpDir, types.Hash(stateRoot)),
 	)
 	defer cluster.Stop()
@@ -165,15 +166,15 @@ func TestMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assert.Equal(t, balanceSender, senderBalanceAfterMigration)
-	assert.Equal(t, balanceReceiver, receiverBalanceAfterMigration)
+	require.Equal(t, balanceSender, senderBalanceAfterMigration)
+	require.Equal(t, balanceReceiver, receiverBalanceAfterMigration)
 
 	deployedCode, err := cluster.Servers[0].JSONRPC().Eth().GetCode(deployedContractBalance, ethgo.Latest)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	require.Equal(t, deployedCode, *types.EncodeBytes(contractsapi.TestWriteBlockMetadata.DeployedBytecode))
+	require.Equal(t, deployedCode, *common.EncodeBytes(contractsapi.TestWriteBlockMetadata.DeployedBytecode))
 	require.NoError(t, cluster.WaitForBlock(10, 1*time.Minute))
 
 	//stop last node of validator and non-validator
@@ -204,6 +205,6 @@ func TestMigration(t *testing.T) {
 	_, err = cluster.InitSecrets("test-chain-8", 1)
 	require.NoError(t, err)
 
-	cluster.InitTestServer(t, 8, false, false)
+	cluster.InitTestServer(t, "test-chain-8", cluster.Bridge.JSONRPCAddr(), frameworkpolybft.None)
 	require.NoError(t, cluster.WaitForBlock(33, time.Minute))
 }

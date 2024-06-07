@@ -90,10 +90,8 @@ func GetTxAndBlockByTxHash(txHash types.Hash, store txLookupAndBlockGetter) (*ty
 		return nil, nil
 	}
 
-	for _, txn := range block.Transactions {
-		if txn.Hash == txHash {
-			return txn, block
-		}
+	if txn, _ := types.FindTxByHash(block.Transactions, txHash); txn != nil {
+		return txn, block
 	}
 
 	return nil, nil
@@ -140,12 +138,9 @@ type nonceGetter interface {
 func GetNextNonce(address types.Address, number BlockNumber, store nonceGetter) (uint64, error) {
 	if number == PendingBlockNumber {
 		// Grab the latest pending nonce from the TxPool
-		//
 		// If the account is not initialized in the local TxPool,
 		// return the latest nonce from the world state
-		res := store.GetNonce(address)
-
-		return res, nil
+		return store.GetNonce(address), nil
 	}
 
 	header, err := GetBlockHeader(number, store)
@@ -167,12 +162,15 @@ func GetNextNonce(address types.Address, number BlockNumber, store nonceGetter) 
 	return acc.Nonce, nil
 }
 
-func DecodeTxn(arg *txnArgs, store nonceGetter) (*types.Transaction, error) {
+func DecodeTxn(arg *txnArgs, blockNumber uint64, store nonceGetter, forceSetNonce bool) (*types.Transaction, error) {
+	if arg == nil {
+		return nil, errors.New("missing value for required argument 0")
+	}
 	// set default values
 	if arg.From == nil {
 		arg.From = &types.ZeroAddress
 		arg.Nonce = argUintPtr(0)
-	} else if arg.Nonce == nil {
+	} else if arg.Nonce == nil || forceSetNonce {
 		// get nonce from the pool
 		nonce, err := GetNextNonce(*arg.From, LatestBlockNumber, store)
 		if err != nil {
@@ -187,6 +185,14 @@ func DecodeTxn(arg *txnArgs, store nonceGetter) (*types.Transaction, error) {
 
 	if arg.GasPrice == nil {
 		arg.GasPrice = argBytesPtr([]byte{})
+	}
+
+	if arg.GasTipCap == nil {
+		arg.GasTipCap = argBytesPtr([]byte{})
+	}
+
+	if arg.GasFeeCap == nil {
+		arg.GasFeeCap = argBytesPtr([]byte{})
 	}
 
 	var input []byte
@@ -208,19 +214,28 @@ func DecodeTxn(arg *txnArgs, store nonceGetter) (*types.Transaction, error) {
 		arg.Gas = argUintPtr(0)
 	}
 
-	txn := &types.Transaction{
-		From:     *arg.From,
-		Gas:      uint64(*arg.Gas),
-		GasPrice: new(big.Int).SetBytes(*arg.GasPrice),
-		Value:    new(big.Int).SetBytes(*arg.Value),
-		Input:    input,
-		Nonce:    uint64(*arg.Nonce),
+	txType := types.LegacyTx
+	if arg.Type != nil {
+		txType = types.TxType(*arg.Type)
 	}
+
+	txn := &types.Transaction{
+		From:      *arg.From,
+		Gas:       uint64(*arg.Gas),
+		GasPrice:  new(big.Int).SetBytes(*arg.GasPrice),
+		GasTipCap: new(big.Int).SetBytes(*arg.GasTipCap),
+		GasFeeCap: new(big.Int).SetBytes(*arg.GasFeeCap),
+		Value:     new(big.Int).SetBytes(*arg.Value),
+		Input:     input,
+		Nonce:     uint64(*arg.Nonce),
+		Type:      txType,
+	}
+
 	if arg.To != nil {
 		txn.To = arg.To
 	}
 
-	txn.ComputeHash()
+	txn.ComputeHash(blockNumber)
 
 	return txn, nil
 }

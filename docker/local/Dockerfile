@@ -1,4 +1,6 @@
-FROM golang:1.18-alpine AS builder
+FROM golang:1.20-alpine AS builder
+
+RUN apk add make git
 
 WORKDIR /polygon-edge
 
@@ -7,7 +9,7 @@ RUN go mod download
 
 COPY . .
 
-RUN go build -o polygon-edge main.go
+RUN make build
 
 FROM alpine:latest AS runner
 
@@ -17,7 +19,6 @@ WORKDIR /polygon-edge
 
 COPY --from=builder /polygon-edge/polygon-edge ./
 COPY ./docker/local/polygon-edge.sh ./
-COPY ./core-contracts/artifacts ./core-contracts/artifacts
 
 # Expose json-rpc, libp2p and grpc ports
 EXPOSE 8545 9632 1478 5001

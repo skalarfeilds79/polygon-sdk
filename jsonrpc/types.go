@@ -5,9 +5,12 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/types"
 )
+
+const jsonRPCMetric = "json_rpc"
 
 // For union type of transaction and types.Hash
 type transactionOrHash interface {
@@ -16,7 +19,9 @@ type transactionOrHash interface {
 
 type transaction struct {
 	Nonce       argUint64      `json:"nonce"`
-	GasPrice    argBig         `json:"gasPrice"`
+	GasPrice    *argBig        `json:"gasPrice,omitempty"`
+	GasTipCap   *argBig        `json:"maxPriorityFeePerGas,omitempty"`
+	GasFeeCap   *argBig        `json:"maxFeePerGas,omitempty"`
 	Gas         argUint64      `json:"gas"`
 	To          *types.Address `json:"to"`
 	Value       argBig         `json:"value"`
@@ -29,6 +34,8 @@ type transaction struct {
 	BlockHash   *types.Hash    `json:"blockHash"`
 	BlockNumber *argUint64     `json:"blockNumber"`
 	TxIndex     *argUint64     `json:"transactionIndex"`
+	ChainID     *argBig        `json:"chainId,omitempty"`
+	Type        argUint64      `json:"type"`
 }
 
 func (t transaction) getHash() types.Hash { return t.Hash }
@@ -53,25 +60,39 @@ func toTransaction(
 	txIndex *int,
 ) *transaction {
 	res := &transaction{
-		Nonce:    argUint64(t.Nonce),
-		GasPrice: argBig(*t.GasPrice),
-		Gas:      argUint64(t.Gas),
-		To:       t.To,
-		Value:    argBig(*t.Value),
-		Input:    t.Input,
-		V:        argBig(*t.V),
-		R:        argBig(*t.R),
-		S:        argBig(*t.S),
-		Hash:     t.Hash,
-		From:     t.From,
+		Nonce:       argUint64(t.Nonce),
+		Gas:         argUint64(t.Gas),
+		To:          t.To,
+		Value:       argBig(*t.Value),
+		Input:       t.Input,
+		V:           argBig(*t.V),
+		R:           argBig(*t.R),
+		S:           argBig(*t.S),
+		Hash:        t.Hash,
+		From:        t.From,
+		Type:        argUint64(t.Type),
+		BlockNumber: blockNumber,
+		BlockHash:   blockHash,
 	}
 
-	if blockNumber != nil {
-		res.BlockNumber = blockNumber
+	if t.GasPrice != nil {
+		gasPrice := argBig(*t.GasPrice)
+		res.GasPrice = &gasPrice
 	}
 
-	if blockHash != nil {
-		res.BlockHash = blockHash
+	if t.GasTipCap != nil {
+		gasTipCap := argBig(*t.GasTipCap)
+		res.GasTipCap = &gasTipCap
+	}
+
+	if t.GasFeeCap != nil {
+		gasFeeCap := argBig(*t.GasFeeCap)
+		res.GasFeeCap = &gasFeeCap
+	}
+
+	if t.ChainID != nil {
+		chainID := argBig(*t.ChainID)
+		res.ChainID = &chainID
 	}
 
 	if txIndex != nil {
@@ -102,6 +123,7 @@ type block struct {
 	Hash            types.Hash          `json:"hash"`
 	Transactions    []transactionOrHash `json:"transactions"`
 	Uncles          []types.Hash        `json:"uncles"`
+	BaseFee         argUint64           `json:"baseFeePerGas,omitempty"`
 }
 
 func (b *block) Copy() *block {
@@ -140,10 +162,12 @@ func toBlock(b *types.Block, fullTx bool) *block {
 		Hash:            h.Hash,
 		Transactions:    []transactionOrHash{},
 		Uncles:          []types.Hash{},
+		BaseFee:         argUint64(h.BaseFee),
 	}
 
 	for idx, txn := range b.Transactions {
 		if fullTx {
+			txn.GasPrice = txn.GetGasPrice(b.Header.BaseFee)
 			res.Transactions = append(
 				res.Transactions,
 				toTransaction(
@@ -184,6 +208,25 @@ type receipt struct {
 	ToAddr            *types.Address `json:"to"`
 }
 
+func toReceipt(src *types.Receipt, tx *types.Transaction,
+	txIndex uint64, header *types.Header, logs []*Log) *receipt {
+	return &receipt{
+		Root:              src.Root,
+		CumulativeGasUsed: argUint64(src.CumulativeGasUsed),
+		LogsBloom:         src.LogsBloom,
+		Status:            argUint64(*src.Status),
+		TxHash:            tx.Hash,
+		TxIndex:           argUint64(txIndex),
+		BlockHash:         header.Hash,
+		BlockNumber:       argUint64(header.Number),
+		GasUsed:           argUint64(src.GasUsed),
+		ContractAddress:   src.ContractAddress,
+		FromAddr:          tx.From,
+		ToAddr:            tx.To,
+		Logs:              logs,
+	}
+}
+
 type Log struct {
 	Address     types.Address `json:"address"`
 	Topics      []types.Hash  `json:"topics"`
@@ -194,6 +237,28 @@ type Log struct {
 	BlockHash   types.Hash    `json:"blockHash"`
 	LogIndex    argUint64     `json:"logIndex"`
 	Removed     bool          `json:"removed"`
+}
+
+func toLogs(srcLogs []*types.Log, baseIdx, txIdx uint64, header *types.Header, txHash types.Hash) []*Log {
+	logs := make([]*Log, len(srcLogs))
+	for i, srcLog := range srcLogs {
+		logs[i] = toLog(srcLog, baseIdx+uint64(i), txIdx, header, txHash)
+	}
+
+	return logs
+}
+
+func toLog(src *types.Log, logIdx, txIdx uint64, header *types.Header, txHash types.Hash) *Log {
+	return &Log{
+		Address:     src.Address,
+		Topics:      src.Topics,
+		Data:        argBytes(src.Data),
+		BlockNumber: argUint64(header.Number),
+		BlockHash:   header.Hash,
+		TxHash:      txHash,
+		TxIndex:     argUint64(txIdx),
+		LogIndex:    argUint64(logIdx),
+	}
 }
 
 type argBig big.Int
@@ -248,9 +313,9 @@ func (u argUint64) MarshalText() ([]byte, error) {
 }
 
 func (u *argUint64) UnmarshalText(input []byte) error {
-	str := strings.TrimPrefix(string(input), "0x")
-	num, err := strconv.ParseUint(str, 16, 64)
+	str := strings.Trim(string(input), "\"")
 
+	num, err := common.ParseUint64orHex(&str)
 	if err != nil {
 		return err
 	}
@@ -258,6 +323,10 @@ func (u *argUint64) UnmarshalText(input []byte) error {
 	*u = argUint64(num)
 
 	return nil
+}
+
+func (u *argUint64) UnmarshalJSON(buffer []byte) error {
+	return u.UnmarshalText(buffer)
 }
 
 type argBytes []byte
@@ -307,14 +376,17 @@ func encodeToHex(b []byte) []byte {
 
 // txnArgs is the transaction argument for the rpc endpoints
 type txnArgs struct {
-	From     *types.Address
-	To       *types.Address
-	Gas      *argUint64
-	GasPrice *argBytes
-	Value    *argBytes
-	Data     *argBytes
-	Input    *argBytes
-	Nonce    *argUint64
+	From      *types.Address
+	To        *types.Address
+	Gas       *argUint64
+	GasPrice  *argBytes
+	GasTipCap *argBytes
+	GasFeeCap *argBytes
+	Value     *argBytes
+	Data      *argBytes
+	Input     *argBytes
+	Nonce     *argUint64
+	Type      *argUint64
 }
 
 type progression struct {
@@ -322,4 +394,29 @@ type progression struct {
 	StartingBlock argUint64 `json:"startingBlock"`
 	CurrentBlock  argUint64 `json:"currentBlock"`
 	HighestBlock  argUint64 `json:"highestBlock"`
+}
+
+type feeHistoryResult struct {
+	OldestBlock   argUint64     `json:"oldestBlock"`
+	BaseFeePerGas []argUint64   `json:"baseFeePerGas,omitempty"`
+	GasUsedRatio  []float64     `json:"gasUsedRatio"`
+	Reward        [][]argUint64 `json:"reward,omitempty"`
+}
+
+func convertToArgUint64Slice(slice []uint64) []argUint64 {
+	argSlice := make([]argUint64, len(slice))
+	for i, value := range slice {
+		argSlice[i] = argUint64(value)
+	}
+
+	return argSlice
+}
+
+func convertToArgUint64SliceSlice(slice [][]uint64) [][]argUint64 {
+	argSlice := make([][]argUint64, len(slice))
+	for i, value := range slice {
+		argSlice[i] = convertToArgUint64Slice(value)
+	}
+
+	return argSlice
 }

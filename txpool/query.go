@@ -1,6 +1,10 @@
 package txpool
 
-import "github.com/0xPolygon/polygon-edge/types"
+import (
+	"sync/atomic"
+
+	"github.com/0xPolygon/polygon-edge/types"
+)
 
 /* QUERY methods */
 // Used to query the pool for specific state info.
@@ -42,7 +46,15 @@ func (p *TxPool) GetPendingTx(txHash types.Hash) (*types.Transaction, bool) {
 func (p *TxPool) GetTxs(inclQueued bool) (
 	allPromoted, allEnqueued map[types.Address][]*types.Transaction,
 ) {
-	allPromoted, allEnqueued = p.accounts.allTxs(inclQueued)
+	return p.accounts.allTxs(inclQueued)
+}
 
-	return
+// GetBaseFee returns current base fee
+func (p *TxPool) GetBaseFee() uint64 {
+	return atomic.LoadUint64(&p.baseFee)
+}
+
+// SetBaseFee calculates base fee from the (current) header and sets value into baseFee field
+func (p *TxPool) SetBaseFee(header *types.Header) {
+	atomic.StoreUint64(&p.baseFee, p.store.CalculateBaseFee(header))
 }

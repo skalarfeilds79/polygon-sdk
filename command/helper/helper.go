@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/0xPolygon/polygon-edge/chain"
@@ -15,11 +17,14 @@ import (
 	"github.com/0xPolygon/polygon-edge/server"
 	"github.com/0xPolygon/polygon-edge/server/proto"
 	txpoolOp "github.com/0xPolygon/polygon-edge/txpool/proto"
+	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/ryanuber/columnize"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+var ErrBlockTrackerPollInterval = errors.New("block tracker poll interval must be greater than 0")
 
 type ClientCloseResult struct {
 	Message string `json:"message"`
@@ -205,7 +210,7 @@ func ParseGRPCAddress(grpcAddress string) (*net.TCPAddr, error) {
 func RegisterJSONRPCFlag(cmd *cobra.Command) {
 	cmd.PersistentFlags().String(
 		command.JSONRPCFlag,
-		fmt.Sprintf("%s:%d", AllInterfacesBinding, server.DefaultJSONRPCPort),
+		fmt.Sprintf("http://%s:%d", AllInterfacesBinding, server.DefaultJSONRPCPort),
 		"the JSON-RPC interface",
 	)
 }
@@ -249,4 +254,62 @@ func SetRequiredFlags(cmd *cobra.Command, requiredFlags []string) {
 	for _, requiredFlag := range requiredFlags {
 		_ = cmd.MarkFlagRequired(requiredFlag)
 	}
+}
+
+func ParseAmount(amount string) (*big.Int, error) {
+	result, ok := new(big.Int).SetString(amount, 0)
+	if !ok || result.Cmp(big.NewInt(0)) <= 0 {
+		return nil, fmt.Errorf("amount %s should be numerical value greater than zero", amount)
+	}
+
+	return result, nil
+}
+
+func ValidateProxyContractsAdmin(proxyContractsAdmin string) error {
+	if err := types.IsValidAddress(proxyContractsAdmin); err != nil {
+		return fmt.Errorf("proxy contracts admin address is not valid: %w", err)
+	}
+
+	proxyContractsAdminAddr := types.StringToAddress(proxyContractsAdmin)
+	if proxyContractsAdminAddr == types.ZeroAddress {
+		return errors.New("proxy contracts admin address must not be zero address")
+	}
+
+	return nil
+}
+
+type PremineInfo struct {
+	Address types.Address
+	Amount  *big.Int
+	Key     string // only used for tests
+}
+
+// parsePremineInfo parses provided premine information and returns premine address and amount
+func ParsePremineInfo(premineInfoRaw string) (*PremineInfo, error) {
+	var (
+		address types.Address
+		amount  = command.DefaultPremineBalance
+		key     string
+		err     error
+	)
+
+	parts := strings.Split(premineInfoRaw, ":")
+
+	if len(parts) > 1 { // <addr>:<balance>
+		amount, err = common.ParseUint256orHex(&parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse amount %s: %w", parts[1], err)
+		}
+
+		address = types.StringToAddress(parts[0])
+
+		if len(parts) == 3 { // <addr>:<balance>:<key>
+			key = parts[2]
+		}
+	} else {
+		// <addr>
+		address = types.StringToAddress(premineInfoRaw)
+	}
+
+	return &PremineInfo{Address: address, Amount: amount, Key: key}, nil
 }

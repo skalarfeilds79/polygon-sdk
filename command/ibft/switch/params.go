@@ -10,17 +10,14 @@ import (
 	"github.com/0xPolygon/polygon-edge/command/helper"
 	"github.com/0xPolygon/polygon-edge/consensus/ibft/fork"
 	"github.com/0xPolygon/polygon-edge/helper/common"
-	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/0xPolygon/polygon-edge/validators"
 )
 
 const (
-	chainFlag         = "chain"
-	typeFlag          = "type"
-	deploymentFlag    = "deployment"
-	fromFlag          = "from"
-	minValidatorCount = "min-validator-count"
-	maxValidatorCount = "max-validator-count"
+	chainFlag      = "chain"
+	typeFlag       = "type"
+	deploymentFlag = "deployment"
+	fromFlag       = "from"
 )
 
 var (
@@ -50,9 +47,10 @@ type switchParams struct {
 	ibftValidatorType    validators.ValidatorType
 
 	// PoA
-	ibftValidatorPrefixPath string
-	ibftValidatorsRaw       []string
-	ibftValidators          validators.Validators
+	validatorRootPath   string
+	validatorPrefixPath string
+	validatorsRaw       []string
+	ibftValidators      validators.Validators
 
 	// PoS
 	maxValidatorCountRaw string
@@ -136,7 +134,7 @@ func (p *switchParams) initDeployment() error {
 			)
 		}
 
-		d, err := types.ParseUint64orHex(&p.deploymentRaw)
+		d, err := common.ParseUint64orHex(&p.deploymentRaw)
 		if err != nil {
 			return fmt.Errorf(
 				"unable to parse deployment value, %w",
@@ -174,12 +172,13 @@ func (p *switchParams) initPoAConfig() error {
 }
 
 func (p *switchParams) setValidatorSetFromPrefixPath() error {
-	if p.ibftValidatorPrefixPath == "" {
+	if p.validatorPrefixPath == "" {
 		return nil
 	}
 
 	validators, err := command.GetValidatorsFromPrefixPath(
-		p.ibftValidatorPrefixPath,
+		p.validatorRootPath,
+		p.validatorPrefixPath,
 		p.ibftValidatorType,
 	)
 	if err != nil {
@@ -195,11 +194,11 @@ func (p *switchParams) setValidatorSetFromPrefixPath() error {
 
 // setValidatorSetFromCli sets validator set from cli command
 func (p *switchParams) setValidatorSetFromCli() error {
-	if len(p.ibftValidatorsRaw) == 0 {
+	if len(p.validatorsRaw) == 0 {
 		return nil
 	}
 
-	newSet, err := validators.ParseValidators(p.ibftValidatorType, p.ibftValidatorsRaw)
+	newSet, err := validators.ParseValidators(p.ibftValidatorType, p.validatorsRaw)
 	if err != nil {
 		return err
 	}
@@ -224,7 +223,7 @@ func (p *switchParams) initPoSConfig() error {
 	}
 
 	if p.minValidatorCountRaw != "" {
-		value, err := types.ParseUint64orHex(&p.minValidatorCountRaw)
+		value, err := common.ParseUint64orHex(&p.minValidatorCountRaw)
 		if err != nil {
 			return fmt.Errorf(
 				"unable to parse min validator count value, %w",
@@ -236,7 +235,7 @@ func (p *switchParams) initPoSConfig() error {
 	}
 
 	if p.maxValidatorCountRaw != "" {
-		value, err := types.ParseUint64orHex(&p.maxValidatorCountRaw)
+		value, err := common.ParseUint64orHex(&p.maxValidatorCountRaw)
 		if err != nil {
 			return fmt.Errorf(
 				"unable to parse max validator count value, %w",
@@ -247,7 +246,18 @@ func (p *switchParams) initPoSConfig() error {
 		p.maxValidatorCount = &value
 	}
 
-	return p.validateMinMaxValidatorNumber()
+	if err := p.validateMinMaxValidatorNumber(); err != nil {
+		return err
+	}
+
+	// Validate validatorRootPath only if validators information were not provided via CLI flag
+	if len(p.validatorsRaw) == 0 {
+		if _, err := os.Stat(p.validatorRootPath); err != nil {
+			return fmt.Errorf("invalid validators path ('%s') provided. Error: %w", p.validatorRootPath, err)
+		}
+	}
+
+	return nil
 }
 
 func (p *switchParams) validateMinMaxValidatorNumber() error {
@@ -273,7 +283,7 @@ func (p *switchParams) validateMinMaxValidatorNumber() error {
 }
 
 func (p *switchParams) initFrom() error {
-	from, err := types.ParseUint64orHex(&p.fromRaw)
+	from, err := common.ParseUint64orHex(&p.fromRaw)
 	if err != nil {
 		return fmt.Errorf("unable to parse from value, %w", err)
 	}
@@ -403,6 +413,7 @@ func appendIBFTForks(
 		Type:          ibftType,
 		ValidatorType: validatorType,
 		From:          common.JSONNumber{Value: from},
+		BlockTime:     lastFork.BlockTime,
 	}
 
 	switch ibftType {

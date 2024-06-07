@@ -57,7 +57,7 @@ func setFlags(cmd *cobra.Command) {
 		&params.configPath,
 		configFlag,
 		"",
-		"the path to the CLI config. Supports .json and .hcl",
+		"the path to the CLI config. Supports .json, .hcl, .yaml, .yml",
 	)
 
 	cmd.Flags().StringVar(
@@ -185,15 +185,8 @@ func setFlags(cmd *cobra.Command) {
 		"maximum number of enqueued transactions per account",
 	)
 
-	cmd.Flags().Uint64Var(
-		&params.rawConfig.BlockTime,
-		blockTimeFlag,
-		defaultConfig.BlockTime,
-		"minimum block time in seconds (at least 1s)",
-	)
-
 	cmd.Flags().StringArrayVar(
-		&params.corsAllowedOrigins,
+		&params.rawConfig.CorsAllowedOrigins,
 		corsOriginFlag,
 		defaultConfig.Headers.AccessControlAllowOrigins,
 		"the CORS header indicating whether any JSON-RPC response can be shared with the specified origin",
@@ -233,6 +226,27 @@ func setFlags(cmd *cobra.Command) {
 		numBlockConfirmationsFlag,
 		defaultConfig.NumBlockConfirmations,
 		"minimal number of child blocks required for the parent block to be considered final",
+	)
+
+	cmd.Flags().Uint64Var(
+		&params.rawConfig.ConcurrentRequestsDebug,
+		concurrentRequestsDebugFlag,
+		defaultConfig.ConcurrentRequestsDebug,
+		"maximal number of concurrent requests for debug endpoints",
+	)
+
+	cmd.Flags().Uint64Var(
+		&params.rawConfig.WebSocketReadLimit,
+		webSocketReadLimitFlag,
+		defaultConfig.WebSocketReadLimit,
+		"maximum size in bytes for a message read from the peer by websocket",
+	)
+
+	cmd.Flags().DurationVar(
+		&params.rawConfig.MetricsInterval,
+		metricsIntervalFlag,
+		defaultConfig.MetricsInterval,
+		"the interval (in seconds) at which special metrics are generated. a value of zero means the metrics are disabled",
 	)
 
 	setLegacyFlags(cmd)

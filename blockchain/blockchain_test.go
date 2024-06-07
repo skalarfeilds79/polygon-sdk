@@ -7,11 +7,15 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/0xPolygon/polygon-edge/helper/common"
+	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/state"
 	"github.com/hashicorp/go-hclog"
+	lru "github.com/hashicorp/golang-lru"
 
 	"github.com/0xPolygon/polygon-edge/chain"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/0xPolygon/polygon-edge/blockchain/storage"
 	"github.com/0xPolygon/polygon-edge/blockchain/storage/memory"
@@ -25,8 +29,7 @@ func TestGenesis(t *testing.T) {
 	genesis := &types.Header{Difficulty: 1, Number: 0}
 	genesis.ComputeHash()
 
-	_, err := b.advanceHead(genesis)
-	assert.NoError(t, err)
+	assert.NoError(t, b.writeGenesisImpl(genesis))
 
 	header := b.Header()
 	assert.Equal(t, header.Hash, genesis.Hash)
@@ -464,7 +467,8 @@ func TestInsertHeaders(t *testing.T) {
 
 			// run the history
 			for i := 1; i < len(cc.History); i++ {
-				if err := b.WriteHeaders([]*types.Header{chain.headers[cc.History[i].header.hash]}); err != nil {
+				headers := []*types.Header{chain.headers[cc.History[i].header.hash]}
+				if err := b.WriteHeadersWithBodies(headers); err != nil {
 					t.Fatal(err)
 				}
 
@@ -533,11 +537,15 @@ func TestForkUnknownParents(t *testing.T) {
 	h1 := AppendNewTestHeaders(h0[:5], 10)
 
 	// Write genesis
-	_, err := b.advanceHead(h0[0])
-	assert.NoError(t, err)
+	batchWriter := storage.NewBatchWriter(b.db)
+	td := new(big.Int).SetUint64(h0[0].Difficulty)
+
+	batchWriter.PutCanonicalHeader(h0[0], td)
+
+	assert.NoError(t, b.writeBatchAndUpdate(batchWriter, h0[0], td, true))
 
 	// Write 10 headers
-	assert.NoError(t, b.WriteHeaders(h0[1:]))
+	assert.NoError(t, b.WriteHeadersWithBodies(h0[1:]))
 
 	// Cannot write this header because the father h1[11] is not known
 	assert.Error(t, b.WriteHeadersWithBodies([]*types.Header{h1[12]}))
@@ -553,14 +561,15 @@ func TestBlockchainWriteBody(t *testing.T) {
 	newChain := func(
 		t *testing.T,
 		txFromByTxHash map[types.Hash]types.Address,
+		path string,
 	) *Blockchain {
 		t.Helper()
 
-		storage, err := memory.NewMemoryStorage(nil)
+		dbStorage, err := memory.NewMemoryStorage(nil)
 		assert.NoError(t, err)
 
 		chain := &Blockchain{
-			db: storage,
+			db: dbStorage,
 			txSigner: &mockSigner{
 				txFromByTxHash: txFromByTxHash,
 			},
@@ -585,17 +594,20 @@ func TestBlockchainWriteBody(t *testing.T) {
 			},
 		}
 
-		tx.ComputeHash()
+		tx.ComputeHash(1)
 		block.Header.ComputeHash()
 
 		txFromByTxHash := map[types.Hash]types.Address{}
 
-		chain := newChain(t, txFromByTxHash)
+		chain := newChain(t, txFromByTxHash, "t1")
+		defer chain.db.Close()
+		batchWriter := storage.NewBatchWriter(chain.db)
 
 		assert.NoError(
 			t,
-			chain.writeBody(block),
+			chain.writeBody(batchWriter, block),
 		)
+		assert.NoError(t, batchWriter.WriteBatch())
 	})
 
 	t.Run("should return error if tx doesn't have from and recovering address fails", func(t *testing.T) {
@@ -613,18 +625,21 @@ func TestBlockchainWriteBody(t *testing.T) {
 			},
 		}
 
-		tx.ComputeHash()
+		tx.ComputeHash(1)
 		block.Header.ComputeHash()
 
 		txFromByTxHash := map[types.Hash]types.Address{}
 
-		chain := newChain(t, txFromByTxHash)
+		chain := newChain(t, txFromByTxHash, "t2")
+		defer chain.db.Close()
+		batchWriter := storage.NewBatchWriter(chain.db)
 
 		assert.ErrorIs(
 			t,
 			errRecoveryAddressFailed,
-			chain.writeBody(block),
+			chain.writeBody(batchWriter, block),
 		)
+		assert.NoError(t, batchWriter.WriteBatch())
 	})
 
 	t.Run("should recover from address and store to storage", func(t *testing.T) {
@@ -642,16 +657,22 @@ func TestBlockchainWriteBody(t *testing.T) {
 			},
 		}
 
-		tx.ComputeHash()
+		tx.ComputeHash(1)
 		block.Header.ComputeHash()
 
 		txFromByTxHash := map[types.Hash]types.Address{
 			tx.Hash: addr,
 		}
 
-		chain := newChain(t, txFromByTxHash)
+		chain := newChain(t, txFromByTxHash, "t3")
+		defer chain.db.Close()
+		batchWriter := storage.NewBatchWriter(chain.db)
 
-		assert.NoError(t, chain.writeBody(block))
+		batchWriter.PutHeader(block.Header)
+
+		assert.NoError(t, chain.writeBody(batchWriter, block))
+
+		assert.NoError(t, batchWriter.WriteBatch())
 
 		readBody, ok := chain.readBody(block.Hash())
 		assert.True(t, ok)
@@ -671,7 +692,7 @@ func Test_recoverFromFieldsInBlock(t *testing.T) {
 
 	computeTxHashes := func(txs ...*types.Transaction) {
 		for _, tx := range txs {
-			tx.ComputeHash()
+			tx.ComputeHash(1)
 		}
 	}
 
@@ -756,7 +777,7 @@ func Test_recoverFromFieldsInTransactions(t *testing.T) {
 
 	computeTxHashes := func(txs ...*types.Transaction) {
 		for _, tx := range txs {
-			tx.ComputeHash()
+			tx.ComputeHash(1)
 		}
 	}
 
@@ -854,7 +875,7 @@ func Test_recoverFromFieldsInTransactions(t *testing.T) {
 }
 
 func TestBlockchainReadBody(t *testing.T) {
-	storage, err := memory.NewMemoryStorage(nil)
+	dbStorage, err := memory.NewMemoryStorage(nil)
 	assert.NoError(t, err)
 
 	txFromByTxHash := make(map[types.Hash]types.Address)
@@ -862,18 +883,20 @@ func TestBlockchainReadBody(t *testing.T) {
 
 	b := &Blockchain{
 		logger: hclog.NewNullLogger(),
-		db:     storage,
+		db:     dbStorage,
 		txSigner: &mockSigner{
 			txFromByTxHash: txFromByTxHash,
 		},
 	}
+
+	batchWriter := storage.NewBatchWriter(b.db)
 
 	tx := &types.Transaction{
 		Value: big.NewInt(10),
 		V:     big.NewInt(1),
 	}
 
-	tx.ComputeHash()
+	tx.ComputeHash(1)
 
 	block := &types.Block{
 		Header: &types.Header{},
@@ -886,9 +909,11 @@ func TestBlockchainReadBody(t *testing.T) {
 
 	txFromByTxHash[tx.Hash] = types.ZeroAddress
 
-	if err := b.writeBody(block); err != nil {
-		t.Fatal(err)
-	}
+	batchWriter.PutCanonicalHeader(block.Header, big.NewInt(0))
+
+	require.NoError(t, b.writeBody(batchWriter, block))
+
+	assert.NoError(t, batchWriter.WriteBatch())
 
 	txFromByTxHash[tx.Hash] = addr
 
@@ -1071,7 +1096,7 @@ func TestBlockchain_VerifyBlockParent(t *testing.T) {
 		// Set up the storage callback
 		storageCallback := func(storage *storage.MockStorage) {
 			storage.HookReadHeader(func(hash types.Hash) (*types.Header, error) {
-				return emptyHeader, nil
+				return emptyHeader.Copy(), nil
 			})
 		}
 
@@ -1085,7 +1110,7 @@ func TestBlockchain_VerifyBlockParent(t *testing.T) {
 		// Create a dummy block whose parent hash will
 		// not match the computed parent hash
 		block := &types.Block{
-			Header: emptyHeader,
+			Header: emptyHeader.Copy(),
 		}
 
 		assert.ErrorIs(t, blockchain.verifyBlockParent(block), ErrParentHashMismatch)
@@ -1097,7 +1122,7 @@ func TestBlockchain_VerifyBlockParent(t *testing.T) {
 		// Set up the storage callback
 		storageCallback := func(storage *storage.MockStorage) {
 			storage.HookReadHeader(func(hash types.Hash) (*types.Header, error) {
-				return emptyHeader, nil
+				return emptyHeader.Copy(), nil
 			})
 		}
 
@@ -1124,7 +1149,7 @@ func TestBlockchain_VerifyBlockParent(t *testing.T) {
 		// Set up the storage callback
 		storageCallback := func(storage *storage.MockStorage) {
 			storage.HookReadHeader(func(hash types.Hash) (*types.Header, error) {
-				return emptyHeader, nil
+				return emptyHeader.Copy(), nil
 			})
 		}
 
@@ -1139,7 +1164,7 @@ func TestBlockchain_VerifyBlockParent(t *testing.T) {
 		block := &types.Block{
 			Header: &types.Header{
 				Number:     10,
-				ParentHash: emptyHeader.Hash,
+				ParentHash: emptyHeader.Copy().Hash,
 			},
 		}
 
@@ -1155,7 +1180,7 @@ func TestBlockchain_VerifyBlockParent(t *testing.T) {
 		// Set up the storage callback
 		storageCallback := func(storage *storage.MockStorage) {
 			storage.HookReadHeader(func(hash types.Hash) (*types.Header, error) {
-				return emptyHeader, nil
+				return emptyHeader.Copy(), nil
 			})
 		}
 
@@ -1261,7 +1286,7 @@ func TestBlockchain_VerifyBlockBody(t *testing.T) {
 		storageCallback := func(storage *storage.MockStorage) {
 			// This is used for parent fetching
 			storage.HookReadHeader(func(hash types.Hash) (*types.Header, error) {
-				return emptyHeader, nil
+				return emptyHeader.Copy(), nil
 			})
 		}
 
@@ -1301,7 +1326,7 @@ func TestBlockchain_VerifyBlockBody(t *testing.T) {
 		storageCallback := func(storage *storage.MockStorage) {
 			// This is used for parent fetching
 			storage.HookReadHeader(func(hash types.Hash) (*types.Header, error) {
-				return emptyHeader, nil
+				return emptyHeader.Copy(), nil
 			})
 		}
 
@@ -1334,4 +1359,165 @@ func TestBlockchain_VerifyBlockBody(t *testing.T) {
 		_, err = blockchain.verifyBlockBody(block)
 		assert.ErrorIs(t, err, errUnableToExecute)
 	})
+}
+
+func TestBlockchain_CalculateBaseFee(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		blockNumber          uint64
+		parentBaseFee        uint64
+		parentGasLimit       uint64
+		parentGasUsed        uint64
+		expectedBaseFee      uint64
+		elasticityMultiplier uint64
+	}{
+		{6, chain.GenesisBaseFee, 20000000, 10000000, chain.GenesisBaseFee, 2}, // usage == target
+		{6, chain.GenesisBaseFee, 20000000, 10000000, 1125000000, 4},           // usage == target
+		{6, chain.GenesisBaseFee, 20000000, 9000000, 987500000, 2},             // usage below target
+		{6, chain.GenesisBaseFee, 20000000, 9000000, 1100000000, 4},            // usage below target
+		{6, chain.GenesisBaseFee, 20000000, 11000000, 1012500000, 2},           // usage above target
+		{6, chain.GenesisBaseFee, 20000000, 11000000, 1150000000, 4},           // usage above target
+		{6, chain.GenesisBaseFee, 20000000, 20000000, 1125000000, 2},           // usage full
+		{6, chain.GenesisBaseFee, 20000000, 20000000, 1375000000, 4},           // usage full
+		{6, chain.GenesisBaseFee, 20000000, 0, 875000000, 2},                   // usage 0
+		{6, chain.GenesisBaseFee, 20000000, 0, 875000000, 4},                   // usage 0
+	}
+
+	for i, test := range tests {
+		i := i
+		test := test
+
+		t.Run(fmt.Sprintf("test case #%d", i+1), func(t *testing.T) {
+			t.Parallel()
+
+			blockchain := &Blockchain{
+				config: &chain.Chain{
+					Params: &chain.Params{
+						Forks: &chain.Forks{
+							chain.London: chain.NewFork(5),
+						},
+					},
+					Genesis: &chain.Genesis{
+						BaseFeeEM:          test.elasticityMultiplier,
+						BaseFeeChangeDenom: chain.BaseFeeChangeDenom,
+					},
+				},
+			}
+
+			parent := &types.Header{
+				Number:   test.blockNumber,
+				GasLimit: test.parentGasLimit,
+				GasUsed:  test.parentGasUsed,
+				BaseFee:  test.parentBaseFee,
+			}
+
+			got := blockchain.CalculateBaseFee(parent)
+			assert.Equal(t, test.expectedBaseFee, got, fmt.Sprintf("expected %d, got %d", test.expectedBaseFee, got))
+		})
+	}
+}
+
+func TestBlockchain_WriteFullBlock(t *testing.T) {
+	t.Parallel()
+
+	getKey := func(p []byte, k []byte) []byte {
+		return append(append(make([]byte, 0, len(p)+len(k)), p...), k...)
+	}
+	db := map[string][]byte{}
+	consensusMock := &MockVerifier{
+		processHeadersFn: func(hs []*types.Header) error {
+			assert.Len(t, hs, 1)
+
+			return nil
+		},
+	}
+
+	storageMock := storage.NewMockStorage()
+	storageMock.HookNewBatch(func() storage.Batch {
+		return memory.NewBatchMemory(db)
+	})
+
+	bc := &Blockchain{
+		gpAverage: &gasPriceAverage{
+			count: new(big.Int),
+		},
+		logger:    hclog.NewNullLogger(),
+		db:        storageMock,
+		consensus: consensusMock,
+		config: &chain.Chain{
+			Params: &chain.Params{
+				Forks: &chain.Forks{
+					chain.London: chain.NewFork(5),
+				},
+			},
+			Genesis: &chain.Genesis{
+				BaseFeeEM: 4,
+			},
+		},
+		stream: newEventStream(),
+	}
+
+	bc.headersCache, _ = lru.New(10)
+	bc.difficultyCache, _ = lru.New(10)
+
+	existingTD := big.NewInt(1)
+	existingHeader := &types.Header{Number: 1}
+	header := &types.Header{
+		Number: 2,
+	}
+	receipts := []*types.Receipt{
+		{GasUsed: 100},
+		{GasUsed: 200},
+	}
+	tx := &types.Transaction{
+		Value: big.NewInt(1),
+	}
+
+	tx.ComputeHash(1)
+	header.ComputeHash()
+	existingHeader.ComputeHash()
+	bc.currentHeader.Store(existingHeader)
+	bc.currentDifficulty.Store(existingTD)
+
+	header.ParentHash = existingHeader.Hash
+	bc.txSigner = &mockSigner{
+		txFromByTxHash: map[types.Hash]types.Address{
+			tx.Hash: {1, 2},
+		},
+	}
+
+	// already existing block write
+	err := bc.WriteFullBlock(&types.FullBlock{
+		Block: &types.Block{
+			Header:       existingHeader,
+			Transactions: []*types.Transaction{tx},
+		},
+		Receipts: receipts,
+	}, "polybft")
+
+	require.NoError(t, err)
+	require.Equal(t, 0, len(db))
+	require.Equal(t, uint64(1), bc.currentHeader.Load().Number)
+
+	// already existing block write
+	err = bc.WriteFullBlock(&types.FullBlock{
+		Block: &types.Block{
+			Header:       header,
+			Transactions: []*types.Transaction{tx},
+		},
+		Receipts: receipts,
+	}, "polybft")
+
+	require.NoError(t, err)
+	require.Equal(t, 8, len(db))
+	require.Equal(t, uint64(2), bc.currentHeader.Load().Number)
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.BODY, header.Hash.Bytes()))])
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.TX_LOOKUP_PREFIX, tx.Hash.Bytes()))])
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.HEADER, header.Hash.Bytes()))])
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.HEAD, storage.HASH))])
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.CANONICAL, common.EncodeUint64ToBytes(header.Number)))])
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.DIFFICULTY, header.Hash.Bytes()))])
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.CANONICAL, common.EncodeUint64ToBytes(header.Number)))])
+	require.NotNil(t, db[hex.EncodeToHex(getKey(storage.RECEIPTS, header.Hash.Bytes()))])
 }

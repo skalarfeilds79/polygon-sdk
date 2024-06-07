@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/0xPolygon/polygon-edge/network"
 	"github.com/hashicorp/hcl"
@@ -25,15 +26,20 @@ type Config struct {
 	TxPool                   *TxPool    `json:"tx_pool" yaml:"tx_pool"`
 	LogLevel                 string     `json:"log_level" yaml:"log_level"`
 	RestoreFile              string     `json:"restore_file" yaml:"restore_file"`
-	BlockTime                uint64     `json:"block_time_s" yaml:"block_time_s"`
 	Headers                  *Headers   `json:"headers" yaml:"headers"`
 	LogFilePath              string     `json:"log_to" yaml:"log_to"`
 	JSONRPCBatchRequestLimit uint64     `json:"json_rpc_batch_request_limit" yaml:"json_rpc_batch_request_limit"`
 	JSONRPCBlockRangeLimit   uint64     `json:"json_rpc_block_range_limit" yaml:"json_rpc_block_range_limit"`
 	JSONLogFormat            bool       `json:"json_log_format" yaml:"json_log_format"`
+	CorsAllowedOrigins       []string   `json:"cors_allowed_origins" yaml:"cors_allowed_origins"`
 
 	Relayer               bool   `json:"relayer" yaml:"relayer"`
 	NumBlockConfirmations uint64 `json:"num_block_confirmations" yaml:"num_block_confirmations"`
+
+	ConcurrentRequestsDebug uint64 `json:"concurrent_requests_debug" yaml:"concurrent_requests_debug"`
+	WebSocketReadLimit      uint64 `json:"web_socket_read_limit" yaml:"web_socket_read_limit"`
+
+	MetricsInterval time.Duration `json:"metrics_interval" yaml:"metrics_interval"`
 }
 
 // Telemetry holds the config details for metric services.
@@ -65,9 +71,6 @@ type Headers struct {
 }
 
 const (
-	// DefaultBlockTime minimum block generation time in seconds
-	DefaultBlockTime uint64 = 2
-
 	// BlockTimeMultiplierForTimeout Multiplier to get IBFT timeout from block time
 	// timeout is calculated when IBFT timeout is not specified
 	BlockTimeMultiplierForTimeout uint64 = 5
@@ -82,6 +85,18 @@ const (
 	// DefaultNumBlockConfirmations minimal number of child blocks required for the parent block to be considered final
 	// on ethereum epoch lasts for 32 blocks. more details: https://www.alchemy.com/overviews/ethereum-commitment-levels
 	DefaultNumBlockConfirmations uint64 = 64
+
+	// DefaultConcurrentRequestsDebug specifies max number of allowed concurrent requests for debug endpoints
+	DefaultConcurrentRequestsDebug uint64 = 32
+
+	// DefaultWebSocketReadLimit specifies max size in bytes for a message read from the peer by Gorrila websocket lib.
+	// If a message exceeds the limit,
+	// the connection sends a close message to the peer and returns ErrReadLimit to the application.
+	DefaultWebSocketReadLimit uint64 = 8192
+
+	// DefaultMetricsInterval specifies the time interval after which Prometheus metrics will be generated.
+	// A value of 0 means the metrics are disabled.
+	DefaultMetricsInterval time.Duration = time.Second * 8
 )
 
 // DefaultConfig returns the default server configuration
@@ -111,7 +126,6 @@ func DefaultConfig() *Config {
 		},
 		LogLevel:    "INFO",
 		RestoreFile: "",
-		BlockTime:   DefaultBlockTime,
 		Headers: &Headers{
 			AccessControlAllowOrigins: []string{"*"},
 		},
@@ -120,6 +134,9 @@ func DefaultConfig() *Config {
 		JSONRPCBlockRangeLimit:   DefaultJSONRPCBlockRangeLimit,
 		Relayer:                  false,
 		NumBlockConfirmations:    DefaultNumBlockConfirmations,
+		ConcurrentRequestsDebug:  DefaultConcurrentRequestsDebug,
+		WebSocketReadLimit:       DefaultWebSocketReadLimit,
+		MetricsInterval:          DefaultMetricsInterval,
 	}
 }
 

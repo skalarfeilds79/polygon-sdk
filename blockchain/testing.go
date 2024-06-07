@@ -97,13 +97,14 @@ func NewTestBlockchain(t *testing.T, headers []*types.Header) *Blockchain {
 		Number:   0,
 		GasLimit: 0,
 	}
+	forksAvail := &chain.Forks{
+		chain.EIP155:    chain.NewFork(0),
+		chain.Homestead: chain.NewFork(0),
+	}
 	config := &chain.Chain{
 		Genesis: genesis,
 		Params: &chain.Params{
-			Forks: &chain.Forks{
-				EIP155:    chain.NewFork(0),
-				Homestead: chain.NewFork(0),
-			},
+			Forks:          forksAvail,
 			BlockGasTarget: defaultBlockGasTarget,
 		},
 	}
@@ -115,12 +116,17 @@ func NewTestBlockchain(t *testing.T, headers []*types.Header) *Blockchain {
 		t.Fatal(err)
 	}
 
-	if headers != nil {
-		if _, err := b.advanceHead(headers[0]); err != nil {
+	if len(headers) > 0 {
+		batchWriter := storage.NewBatchWriter(b.db)
+		td := new(big.Int).SetUint64(headers[0].Difficulty)
+
+		batchWriter.PutCanonicalHeader(headers[0], td)
+
+		if err := b.writeBatchAndUpdate(batchWriter, headers[0], td, true); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := b.WriteHeaders(headers[1:]); err != nil {
+		if err := b.WriteHeadersWithBodies(headers[1:]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -205,7 +211,7 @@ func NewMockBlockchain(
 		consensus: mockVerifier,
 		executor:  executor,
 		config:    config,
-		stream:    &eventStream{},
+		stream:    newEventStream(),
 		gpAverage: &gasPriceAverage{
 			price: big.NewInt(0),
 			count: big.NewInt(0),
@@ -224,7 +230,7 @@ func NewMockBlockchain(
 type verifyHeaderDelegate func(*types.Header) error
 type processHeadersDelegate func([]*types.Header) error
 type getBlockCreatorDelegate func(*types.Header) (types.Address, error)
-type preStateCommitDelegate func(*types.Header, *state.Transition) error
+type preStateCommitDelegate func(*types.Block, *state.Transition) error
 
 type MockVerifier struct {
 	verifyHeaderFn    verifyHeaderDelegate
@@ -269,9 +275,9 @@ func (m *MockVerifier) HookGetBlockCreator(fn getBlockCreatorDelegate) {
 	m.getBlockCreatorFn = fn
 }
 
-func (m *MockVerifier) PreCommitState(header *types.Header, txn *state.Transition) error {
+func (m *MockVerifier) PreCommitState(block *types.Block, txn *state.Transition) error {
 	if m.preStateCommitFn != nil {
-		return m.preStateCommitFn(header, txn)
+		return m.preStateCommitFn(block, txn)
 	}
 
 	return nil

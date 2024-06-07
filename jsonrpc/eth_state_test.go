@@ -11,7 +11,6 @@ import (
 	"github.com/0xPolygon/polygon-edge/state/runtime"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/stretchr/testify/assert"
-	"github.com/umbracle/fastrlp"
 )
 
 var (
@@ -555,10 +554,7 @@ func TestEth_State_GetStorageAt(t *testing.T) {
 				}
 				account := store.account
 				for index, data := range storage {
-					a := &fastrlp.Arena{}
-					value := a.NewBytes(data.Bytes())
-					newData := value.MarshalTo(nil)
-					account.Storage(index, newData)
+					account.Storage(index, data.Bytes())
 				}
 			}
 
@@ -593,6 +589,7 @@ func constructMockTx(gasLimit *argUint64, data *argBytes) *txnArgs {
 
 func getExampleStore() *mockSpecialStore {
 	return &mockSpecialStore{
+		ethStore: newMockBlockStore(),
 		account: &mockAccount{
 			address: addr0,
 			account: &Account{
@@ -616,10 +613,7 @@ func getExampleStore() *mockSpecialStore {
 // the latest block gas limit for the upper bound, or the specified
 // gas limit in the transaction
 func TestEth_EstimateGas_GasLimit(t *testing.T) {
-	//nolint:godox
-	// TODO Make this test run in parallel when the race condition is fixed in gas estimation (to be fixed in EVM-523)
-	store := getExampleStore()
-	ethEndpoint := newTestEthEndpoint(store)
+	t.Parallel()
 
 	testTable := []struct {
 		name             string
@@ -654,7 +648,14 @@ func TestEth_EstimateGas_GasLimit(t *testing.T) {
 	}
 
 	for _, testCase := range testTable {
+		testCase := testCase
+
 		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := getExampleStore()
+			ethEndpoint := newTestEthEndpoint(store)
+
 			// Set up the apply hook
 			if errors.Is(testCase.expectedError, state.ErrNotEnoughIntrinsicGas) {
 				// We want to trigger a situation where no value in the gas range is correct
@@ -691,7 +692,7 @@ func TestEth_EstimateGas_GasLimit(t *testing.T) {
 				assert.ErrorIs(t, estimateErr, testCase.expectedError)
 
 				// Make sure the estimate is nullified
-				assert.Equal(t, 0, estimate)
+				assert.Equal(t, []byte{}, estimate)
 			} else {
 				// Make sure no errors occurred
 				assert.NoError(t, estimateErr)
@@ -704,45 +705,74 @@ func TestEth_EstimateGas_GasLimit(t *testing.T) {
 }
 
 func TestEth_EstimateGas_Reverts(t *testing.T) {
-	// Example revert data that has the string "revert reason" as the revert reason
-	exampleReturnData := "08c379a000000000000000000000000000000000000000000000000000000000000000" +
-		"20000000000000000000000000000000000000000000000000000000000000000d72657665727420726561736f6e" +
-		"00000000000000000000000000000000000000"
-	rawReturnData, err := hex.DecodeHex(exampleReturnData)
-	assert.NoError(t, err)
-
-	revertReason := errors.New("revert reason")
+	testTable := []struct {
+		name              string
+		exampleReturnData string
+		revertReason      error
+		err               error
+	}{
+		{
+			"revert with string message 'revert reason'",
+			// Example revert data that has the string "revert reason" as the revert reason
+			"08c379a000000000000000000000000000000000000000000000000000000000000000" +
+				"20000000000000000000000000000000000000000000000000000000000000000d72657665727420726561736f6e" +
+				"00000000000000000000000000000000000000",
+			errors.New("revert reason"),
+			runtime.ErrExecutionReverted,
+		},
+		{
+			"revert with custom solidity error",
+			// First 4 bytes of ABI encoded custom solidity error PermissionedContractAccessDenied()
+			"8cd01c38",
+			errors.New(""), // revert reason in this case doesn't exist, reason is decoded in response data
+			runtime.ErrExecutionReverted,
+		},
+		{
+			"revert with empty response",
+			"",
+			errors.New(""),
+			runtime.ErrExecutionReverted,
+		},
+	}
 
 	store := getExampleStore()
 	ethEndpoint := newTestEthEndpoint(store)
 
-	// We want to simulate an EVM revert here
-	store.applyTxnHook = func(
-		header *types.Header,
-		txn *types.Transaction,
-	) (*runtime.ExecutionResult, error) {
-		return &runtime.ExecutionResult{
-			ReturnValue: rawReturnData,
-			Err:         runtime.ErrExecutionReverted,
-		}, nil
+	for _, test := range testTable {
+		rawReturnData, err := hex.DecodeHex(test.exampleReturnData)
+		assert.NoError(t, err)
+
+		// We want to simulate an EVM revert here
+		store.applyTxnHook = func(
+			header *types.Header,
+			txn *types.Transaction,
+		) (*runtime.ExecutionResult, error) {
+			return &runtime.ExecutionResult{
+				ReturnValue: rawReturnData,
+				Err:         runtime.ErrExecutionReverted,
+			}, nil
+		}
+
+		// Run the estimation
+		estimate, estimateErr := ethEndpoint.EstimateGas(
+			constructMockTx(nil, nil),
+			nil,
+		)
+
+		responseData, ok := estimate.([]byte)
+		assert.True(t, ok)
+
+		assert.Equal(t, test.exampleReturnData, string(responseData))
+
+		// Make sure the EVM revert message is contained
+		assert.ErrorIs(t, estimateErr, runtime.ErrExecutionReverted)
+
+		// Make sure the EVM revert reason is contained
+		assert.ErrorAs(t, estimateErr, &test.revertReason)
 	}
-
-	// Run the estimation
-	estimate, estimateErr := ethEndpoint.EstimateGas(
-		constructMockTx(nil, nil),
-		nil,
-	)
-
-	assert.Equal(t, 0, estimate)
-
-	// Make sure the EVM revert message is contained
-	assert.ErrorIs(t, estimateErr, runtime.ErrExecutionReverted)
-
-	// Make sure the EVM revert reason is contained
-	assert.ErrorAs(t, estimateErr, &revertReason)
 }
 
-func TestEth_EstimateGas_Errors(t *testing.T) {
+func TestEth_EstimateGas_ValueTransfer(t *testing.T) {
 	store := getExampleStore()
 	ethEndpoint := newTestEthEndpoint(store)
 
@@ -750,19 +780,51 @@ func TestEth_EstimateGas_Errors(t *testing.T) {
 	store.account.account.Balance = big.NewInt(0)
 
 	// The transaction has a value > 0
+	from := types.StringToAddress("0xSenderAddress")
+	to := types.StringToAddress("0xReceiverAddress")
 	mockTx := constructMockTx(nil, nil)
 	mockTx.Value = argBytesPtr([]byte{0x1})
+	mockTx.From = &from
+	mockTx.To = &to
 
 	// Run the estimation
-	estimate, estimateErr := ethEndpoint.EstimateGas(
+	estimate, err := ethEndpoint.EstimateGas(
 		mockTx,
 		nil,
 	)
 
-	assert.Equal(t, 0, estimate)
+	assert.NotNil(t, estimate)
+	estimateUint64, ok := estimate.(argUint64)
+	assert.True(t, ok)
+	assert.NoError(t, err)
+	assert.Equal(t, state.TxGas, uint64(estimateUint64)) // simple value transfers are 21000wei always
+}
 
-	// Make sure the insufficient funds error message is contained
-	assert.ErrorIs(t, estimateErr, ErrInsufficientFunds)
+func TestEth_EstimateGas_ContractCreation(t *testing.T) {
+	store := getExampleStore()
+	ethEndpoint := newTestEthEndpoint(store)
+
+	// Account doesn't have any balance
+	store.account.account.Balance = big.NewInt(0)
+
+	// The transaction has a value > 0
+	from := types.StringToAddress("0xSenderAddress")
+	mockTx := constructMockTx(nil, nil)
+	mockTx.From = &from
+	mockTx.Input = argBytesPtr([]byte{})
+	mockTx.To = nil
+
+	// Run the estimation
+	estimate, err := ethEndpoint.EstimateGas(
+		mockTx,
+		nil,
+	)
+
+	assert.NotNil(t, estimate)
+	estimateUint64, ok := estimate.(argUint64)
+	assert.True(t, ok)
+	assert.NoError(t, err)
+	assert.Equal(t, state.TxGasContractCreation, uint64(estimateUint64))
 }
 
 type mockSpecialStore struct {
@@ -837,10 +899,10 @@ func (m *mockSpecialStore) GetCode(root types.Hash, addr types.Address) ([]byte,
 }
 
 func (m *mockSpecialStore) GetForksInTime(blockNumber uint64) chain.ForksInTime {
-	return chain.ForksInTime{}
+	return chain.AllForksEnabled.At(0)
 }
 
-func (m *mockSpecialStore) ApplyTxn(header *types.Header, txn *types.Transaction) (*runtime.ExecutionResult, error) {
+func (m *mockSpecialStore) ApplyTxn(header *types.Header, txn *types.Transaction, _ types.StateOverride, _ bool) (*runtime.ExecutionResult, error) {
 	if m.applyTxnHook != nil {
 		return m.applyTxnHook(header, txn)
 	}

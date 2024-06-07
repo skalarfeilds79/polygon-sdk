@@ -194,7 +194,7 @@ func TestValidateSignatureValues(t *testing.T) {
 			name:      "should be invalid if v & s are out of range",
 			homestead: true, v: two, r: one, s: zero, res: false,
 		},
-		// correct v, incorrent r, s
+		// correct v, incorrect r, s
 		{
 			name:      "should be invalid if r & s are nil",
 			homestead: true, v: zero, r: nil, s: nil, res: false,
@@ -454,13 +454,6 @@ func TestRecoverPublicKey(t *testing.T) {
 
 		_, err := RecoverPubkey(testSignature, []byte{0, 1})
 		require.ErrorIs(t, err, errHashOfInvalidLength)
-	})
-
-	t.Run("Zero hash", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := RecoverPubkey(testSignature, types.ZeroHash[:])
-		require.ErrorIs(t, err, errZeroHash)
 	})
 
 	t.Run("Ok signature and hash", func(t *testing.T) {

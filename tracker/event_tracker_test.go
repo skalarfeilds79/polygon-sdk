@@ -20,7 +20,7 @@ type mockEventSubscriber struct {
 	logs []*ethgo.Log
 }
 
-func (m *mockEventSubscriber) AddLog(log *ethgo.Log) {
+func (m *mockEventSubscriber) AddLog(log *ethgo.Log) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -29,6 +29,8 @@ func (m *mockEventSubscriber) AddLog(log *ethgo.Log) {
 	}
 
 	m.logs = append(m.logs, log)
+
+	return nil
 }
 
 func (m *mockEventSubscriber) len() int {
@@ -39,8 +41,6 @@ func (m *mockEventSubscriber) len() int {
 }
 
 func TestEventTracker_TrackSyncEvents(t *testing.T) {
-	t.Parallel()
-
 	const (
 		numBlockConfirmations = 6
 		eventsPerStep         = 8
@@ -82,6 +82,7 @@ func TestEventTracker_TrackSyncEvents(t *testing.T) {
 		rpcEndpoint:           server.HTTPAddr(),
 		contractAddr:          addr,
 		numBlockConfirmations: numBlockConfirmations,
+		pollInterval:          time.Second,
 	}
 
 	err = tracker.Start(context.Background())

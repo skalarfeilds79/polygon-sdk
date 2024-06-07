@@ -6,16 +6,17 @@ import (
 	"math"
 	"math/big"
 
+	"github.com/hashicorp/go-hclog"
+
 	"github.com/0xPolygon/polygon-edge/chain"
 	"github.com/0xPolygon/polygon-edge/contracts"
 	"github.com/0xPolygon/polygon-edge/crypto"
 	"github.com/0xPolygon/polygon-edge/state/runtime"
-	"github.com/0xPolygon/polygon-edge/state/runtime/allowlist"
+	"github.com/0xPolygon/polygon-edge/state/runtime/addresslist"
 	"github.com/0xPolygon/polygon-edge/state/runtime/evm"
 	"github.com/0xPolygon/polygon-edge/state/runtime/precompiled"
 	"github.com/0xPolygon/polygon-edge/state/runtime/tracer"
 	"github.com/0xPolygon/polygon-edge/types"
-	"github.com/hashicorp/go-hclog"
 )
 
 const (
@@ -25,8 +26,6 @@ const (
 	TxGas                 uint64 = 21000 // Per transaction not creating a contract
 	TxGasContractCreation uint64 = 53000 // Per transaction that creates a contract
 )
-
-var emptyCodeHashTwo = types.BytesToHash(crypto.Keccak256(nil))
 
 // GetHashByNumber returns the hash function of a block number
 type GetHashByNumber = func(i uint64) types.Hash
@@ -112,8 +111,15 @@ func (e *Executor) WriteGenesis(
 		}
 	}
 
-	objs := txn.Commit(false)
-	_, root := snap.Commit(objs)
+	objs, err := txn.Commit(false)
+	if err != nil {
+		return types.Hash{}, err
+	}
+
+	_, root, err := snap.Commit(objs)
+	if err != nil {
+		return types.Hash{}, err
+	}
 
 	return types.BytesToHash(root), nil
 }
@@ -136,15 +142,11 @@ func (e *Executor) ProcessBlock(
 	}
 
 	for _, t := range block.Transactions {
-		if t.ExceedsBlockGasLimit(block.Header.GasLimit) {
-			if err := txn.WriteFailedReceipt(t); err != nil {
-				return nil, err
-			}
-
+		if t.Gas > block.Header.GasLimit {
 			continue
 		}
 
-		if err := txn.Write(t); err != nil {
+		if err = txn.Write(t); err != nil {
 			return nil, err
 		}
 	}
@@ -179,15 +181,25 @@ func (e *Executor) BeginTxn(
 		return nil, err
 	}
 
+	burnContract := types.ZeroAddress
+	if forkConfig.London {
+		burnContract, err = e.config.CalculateBurnContract(header.Number)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	newTxn := NewTxn(auxSnap2)
 
 	txCtx := runtime.TxContext{
-		Coinbase:   coinbaseReceiver,
-		Timestamp:  int64(header.Timestamp),
-		Number:     int64(header.Number),
-		Difficulty: types.BytesToHash(new(big.Int).SetUint64(header.Difficulty).Bytes()),
-		GasLimit:   int64(header.GasLimit),
-		ChainID:    e.config.ChainID,
+		Coinbase:     coinbaseReceiver,
+		Timestamp:    int64(header.Timestamp),
+		Number:       int64(header.Number),
+		Difficulty:   types.BytesToHash(new(big.Int).SetUint64(header.Difficulty).Bytes()),
+		BaseFee:      new(big.Int).SetUint64(header.BaseFee),
+		GasLimit:     int64(header.GasLimit),
+		ChainID:      e.config.ChainID,
+		BurnContract: burnContract,
 	}
 
 	txn := &Transition{
@@ -210,12 +222,29 @@ func (e *Executor) BeginTxn(
 
 	// enable contract deployment allow list (if any)
 	if e.config.ContractDeployerAllowList != nil {
-		txn.deploymentAllowlist = allowlist.NewAllowList(txn, contracts.AllowListContractsAddr)
+		txn.deploymentAllowList = addresslist.NewAddressList(txn, contracts.AllowListContractsAddr)
+	}
+
+	if e.config.ContractDeployerBlockList != nil {
+		txn.deploymentBlockList = addresslist.NewAddressList(txn, contracts.BlockListContractsAddr)
 	}
 
 	// enable transactions allow list (if any)
 	if e.config.TransactionsAllowList != nil {
-		txn.txnAllowList = allowlist.NewAllowList(txn, contracts.AllowListTransactionsAddr)
+		txn.txnAllowList = addresslist.NewAddressList(txn, contracts.AllowListTransactionsAddr)
+	}
+
+	if e.config.TransactionsBlockList != nil {
+		txn.txnBlockList = addresslist.NewAddressList(txn, contracts.BlockListTransactionsAddr)
+	}
+
+	// enable transactions allow list (if any)
+	if e.config.BridgeAllowList != nil {
+		txn.bridgeAllowList = addresslist.NewAddressList(txn, contracts.AllowListBridgeAddr)
+	}
+
+	if e.config.BridgeBlockList != nil {
+		txn.bridgeBlockList = addresslist.NewAddressList(txn, contracts.BlockListBridgeAddr)
 	}
 
 	return txn, nil
@@ -245,8 +274,12 @@ type Transition struct {
 	precompiles *precompiled.Precompiled
 
 	// allow list runtimes
-	deploymentAllowlist *allowlist.AllowList
-	txnAllowList        *allowlist.AllowList
+	deploymentAllowList *addresslist.AddressList
+	deploymentBlockList *addresslist.AddressList
+	txnAllowList        *addresslist.AddressList
+	txnBlockList        *addresslist.AddressList
+	bridgeAllowList     *addresslist.AddressList
+	bridgeBlockList     *addresslist.AddressList
 }
 
 func NewTransition(config chain.ForksInTime, snap Snapshot, radix *Txn) *Transition {
@@ -259,6 +292,36 @@ func NewTransition(config chain.ForksInTime, snap Snapshot, radix *Txn) *Transit
 	}
 }
 
+func (t *Transition) WithStateOverride(override types.StateOverride) error {
+	for addr, o := range override {
+		if o.State != nil && o.StateDiff != nil {
+			return fmt.Errorf("cannot override both state and state diff")
+		}
+
+		if o.Nonce != nil {
+			t.state.SetNonce(addr, *o.Nonce)
+		}
+
+		if o.Balance != nil {
+			t.state.SetBalance(addr, o.Balance)
+		}
+
+		if o.Code != nil {
+			t.state.SetCode(addr, o.Code)
+		}
+
+		if o.State != nil {
+			t.state.SetFullStorage(addr, o.State)
+		}
+
+		for k, v := range o.StateDiff {
+			t.state.SetState(addr, k, v)
+		}
+	}
+
+	return nil
+}
+
 func (t *Transition) TotalGas() uint64 {
 	return t.totalGas
 }
@@ -269,42 +332,12 @@ func (t *Transition) Receipts() []*types.Receipt {
 
 var emptyFrom = types.Address{}
 
-func (t *Transition) WriteFailedReceipt(txn *types.Transaction) error {
-	signer := crypto.NewSigner(t.config, uint64(t.ctx.ChainID))
-
-	if txn.From == emptyFrom && txn.Type == types.LegacyTx {
-		// Decrypt the from address
-		from, err := signer.Sender(txn)
-		if err != nil {
-			return NewTransitionApplicationError(err, false)
-		}
-
-		txn.From = from
-	}
-
-	receipt := &types.Receipt{
-		CumulativeGasUsed: t.totalGas,
-		TransactionType:   txn.Type,
-		TxHash:            txn.Hash,
-		Logs:              t.state.Logs(),
-	}
-
-	receipt.LogsBloom = types.CreateBloom([]*types.Receipt{receipt})
-	receipt.SetStatus(types.ReceiptFailed)
-	t.receipts = append(t.receipts, receipt)
-
-	if txn.To == nil {
-		receipt.ContractAddress = crypto.CreateAddress(txn.From, txn.Nonce).Ptr()
-	}
-
-	return nil
-}
-
 // Write writes another transaction to the executor
 func (t *Transition) Write(txn *types.Transaction) error {
 	var err error
 
-	if txn.From == emptyFrom && txn.Type == types.LegacyTx {
+	if txn.From == emptyFrom &&
+		(txn.Type == types.LegacyTx || txn.Type == types.DynamicFeeTx) {
 		// Decrypt the from address
 		signer := crypto.NewSigner(t.config, uint64(t.ctx.ChainID))
 
@@ -336,7 +369,9 @@ func (t *Transition) Write(txn *types.Transaction) error {
 	}
 
 	// The suicided accounts are set as deleted for the next iteration
-	t.state.CleanDeleteObjects(true)
+	if err := t.state.CleanDeleteObjects(true); err != nil {
+		return fmt.Errorf("failed to clean deleted objects: %w", err)
+	}
 
 	if result.Failed() {
 		receipt.SetStatus(types.ReceiptFailed)
@@ -358,11 +393,18 @@ func (t *Transition) Write(txn *types.Transaction) error {
 }
 
 // Commit commits the final result
-func (t *Transition) Commit() (Snapshot, types.Hash) {
-	objs := t.state.Commit(t.config.EIP155)
-	s2, root := t.snap.Commit(objs)
+func (t *Transition) Commit() (Snapshot, types.Hash, error) {
+	objs, err := t.state.Commit(t.config.EIP155)
+	if err != nil {
+		return nil, types.ZeroHash, err
+	}
 
-	return s2, types.BytesToHash(root)
+	s2, root, err := t.snap.Commit(objs)
+	if err != nil {
+		return nil, types.ZeroHash, err
+	}
+
+	return s2, types.BytesToHash(root), nil
 }
 
 func (t *Transition) subGasPool(amount uint64) error {
@@ -389,7 +431,9 @@ func (t *Transition) Apply(msg *types.Transaction) (*runtime.ExecutionResult, er
 
 	result, err := t.apply(msg)
 	if err != nil {
-		t.state.RevertToSnapshot(s)
+		if revertErr := t.state.RevertToSnapshot(s); revertErr != nil {
+			return nil, revertErr
+		}
 	}
 
 	if t.PostHook != nil {
@@ -406,9 +450,7 @@ func (t *Transition) ContextPtr() *runtime.TxContext {
 }
 
 func (t *Transition) subGasLimitPrice(msg *types.Transaction) error {
-	// deduct the upfront max gas cost
-	upfrontGasCost := new(big.Int).Set(msg.GasPrice)
-	upfrontGasCost.Mul(upfrontGasCost, new(big.Int).SetUint64(msg.Gas))
+	upfrontGasCost := GetLondonFixHandler(uint64(t.ctx.Number)).getUpfrontGasCost(msg, t.ctx.BaseFee)
 
 	if err := t.state.SubBalance(msg.From, upfrontGasCost); err != nil {
 		if errors.Is(err, runtime.ErrNotEnoughFunds) {
@@ -431,16 +473,40 @@ func (t *Transition) nonceCheck(msg *types.Transaction) error {
 	return nil
 }
 
+// checkDynamicFees checks correctness of the EIP-1559 feature-related fields.
+// Basically, makes sure gas tip cap and gas fee cap are good for dynamic and legacy transactions
+func (t *Transition) checkDynamicFees(msg *types.Transaction) error {
+	return GetLondonFixHandler(uint64(t.ctx.Number)).checkDynamicFees(msg, t)
+}
+
 // errors that can originate in the consensus rules checks of the apply method below
 // surfacing of these errors reject the transaction thus not including it in the block
 
 var (
-	ErrNonceIncorrect        = fmt.Errorf("incorrect nonce")
-	ErrNotEnoughFundsForGas  = fmt.Errorf("not enough funds to cover gas costs")
-	ErrBlockLimitReached     = fmt.Errorf("gas limit reached in the pool")
-	ErrIntrinsicGasOverflow  = fmt.Errorf("overflow in intrinsic gas calculation")
-	ErrNotEnoughIntrinsicGas = fmt.Errorf("not enough gas supplied for intrinsic gas costs")
-	ErrNotEnoughFunds        = fmt.Errorf("not enough funds for transfer with given value")
+	ErrNonceIncorrect        = errors.New("incorrect nonce")
+	ErrNotEnoughFundsForGas  = errors.New("not enough funds to cover gas costs")
+	ErrBlockLimitReached     = errors.New("gas limit reached in the pool")
+	ErrIntrinsicGasOverflow  = errors.New("overflow in intrinsic gas calculation")
+	ErrNotEnoughIntrinsicGas = errors.New("not enough gas supplied for intrinsic gas costs")
+
+	// ErrTipAboveFeeCap is a sanity error to ensure no one is able to specify a
+	// transaction with a tip higher than the total fee cap.
+	ErrTipAboveFeeCap = errors.New("max priority fee per gas higher than max fee per gas")
+
+	// ErrTipVeryHigh is a sanity error to avoid extremely big numbers specified
+	// in the tip field.
+	ErrTipVeryHigh = errors.New("max priority fee per gas higher than 2^256-1")
+
+	// ErrFeeCapVeryHigh is a sanity error to avoid extremely big numbers specified
+	// in the fee cap field.
+	ErrFeeCapVeryHigh = errors.New("max fee per gas higher than 2^256-1")
+
+	// ErrFeeCapTooLow is returned if the transaction fee cap is less than the
+	// the base fee of the block.
+	ErrFeeCapTooLow = errors.New("max fee per gas less than block base fee")
+
+	// ErrNonceUintOverflow is returned if uint64 overflow happens
+	ErrNonceUintOverflow = errors.New("nonce uint64 overflow")
 )
 
 type TransitionApplicationError struct {
@@ -470,18 +536,20 @@ func NewGasLimitReachedTransitionApplicationError(err error) *GasLimitReachedTra
 }
 
 func (t *Transition) apply(msg *types.Transaction) (*runtime.ExecutionResult, error) {
+	var err error
+
 	if msg.Type == types.StateTx {
-		if err := checkAndProcessStateTx(msg, t); err != nil {
-			return nil, err
-		}
+		err = checkAndProcessStateTx(msg)
 	} else {
-		if err := checkAndProcessLegacyTx(msg, t); err != nil {
-			return nil, err
-		}
+		err = checkAndProcessTx(msg, t)
+	}
+
+	if err != nil {
+		return nil, err
 	}
 
 	// the amount of gas required is available in the block
-	if err := t.subGasPool(msg.Gas); err != nil {
+	if err = t.subGasPool(msg.Gas); err != nil {
 		return nil, NewGasLimitReachedTransitionApplicationError(err)
 	}
 
@@ -502,7 +570,7 @@ func (t *Transition) apply(msg *types.Transaction) (*runtime.ExecutionResult, er
 		return nil, NewTransitionApplicationError(ErrNotEnoughIntrinsicGas, false)
 	}
 
-	gasPrice := new(big.Int).Set(msg.GasPrice)
+	gasPrice := msg.GetGasPrice(t.ctx.BaseFee.Uint64())
 	value := new(big.Int).Set(msg.Value)
 
 	// set the specific transaction fields in the context
@@ -513,7 +581,9 @@ func (t *Transition) apply(msg *types.Transaction) (*runtime.ExecutionResult, er
 	if msg.IsContractCreation() {
 		result = t.Create2(msg.From, msg.Input, value, gasLeft)
 	} else {
-		t.state.IncrNonce(msg.From)
+		if err := t.state.IncrNonce(msg.From); err != nil {
+			return nil, err
+		}
 		result = t.Call2(msg.From, *msg.To, msg.Input, value, gasLeft)
 	}
 
@@ -524,13 +594,28 @@ func (t *Transition) apply(msg *types.Transaction) (*runtime.ExecutionResult, er
 		t.ctx.Tracer.TxEnd(result.GasLeft)
 	}
 
-	// refund the sender
-	remaining := new(big.Int).Mul(new(big.Int).SetUint64(result.GasLeft), msg.GasPrice)
+	// Refund the sender
+	remaining := new(big.Int).Mul(new(big.Int).SetUint64(result.GasLeft), gasPrice)
 	t.state.AddBalance(msg.From, remaining)
 
-	// pay the coinbase
-	coinbaseFee := new(big.Int).Mul(new(big.Int).SetUint64(result.GasUsed), msg.GasPrice)
+	// Spec: https://eips.ethereum.org/EIPS/eip-1559#specification
+	// Define effective tip based on tx type.
+	// We use EIP-1559 fields of the tx if the london hardfork is enabled.
+	// Effective tip became to be either gas tip cap or (gas fee cap - current base fee)
+	effectiveTip := GetLondonFixHandler(uint64(t.ctx.Number)).getEffectiveTip(
+		msg, gasPrice, t.ctx.BaseFee, t.config.London,
+	)
+
+	// Pay the coinbase fee as a miner reward using the calculated effective tip.
+	coinbaseFee := new(big.Int).Mul(new(big.Int).SetUint64(result.GasUsed), effectiveTip)
 	t.state.AddBalance(t.ctx.Coinbase, coinbaseFee)
+
+	// Burn some amount if the london hardfork is applied.
+	// Basically, burn amount is just transferred to the current burn contract.
+	if t.config.London && msg.Type != types.StateTx {
+		burnAmount := new(big.Int).Mul(new(big.Int).SetUint64(result.GasUsed), t.ctx.BaseFee)
+		t.state.AddBalance(t.ctx.BurnContract, burnAmount)
+	}
 
 	// return gas to the pool
 	t.addGasPool(result.GasLeft)
@@ -563,21 +648,40 @@ func (t *Transition) Call2(
 }
 
 func (t *Transition) run(contract *runtime.Contract, host runtime.Host) *runtime.ExecutionResult {
-	// check allow list (if any)
-	if t.deploymentAllowlist != nil && t.deploymentAllowlist.Addr() == contract.CodeAddress {
-		return t.deploymentAllowlist.Run(contract, host, &t.config)
+	if result := t.handleAllowBlockListsUpdate(contract, host); result != nil {
+		return result
 	}
 
+	// check txns access lists, allow list takes precedence over block list
 	if t.txnAllowList != nil {
-		if t.txnAllowList.Addr() == contract.CodeAddress {
-			return t.txnAllowList.Run(contract, host, &t.config)
-		}
-
 		if contract.Caller != contracts.SystemCaller {
-			txnAllowListRole := t.txnAllowList.GetRole(contract.Caller)
-			if !txnAllowListRole.Enabled() {
+			role := t.txnAllowList.GetRole(contract.Caller)
+			if !role.Enabled() {
+				t.logger.Debug(
+					"Failing transaction. Caller is not in the transaction allowlist",
+					"contract.Caller", contract.Caller,
+					"contract.Address", contract.Address,
+				)
+
 				return &runtime.ExecutionResult{
-					Err: fmt.Errorf("caller not authorized"),
+					GasLeft: 0,
+					Err:     runtime.ErrNotAuth,
+				}
+			}
+		}
+	} else if t.txnBlockList != nil {
+		if contract.Caller != contracts.SystemCaller {
+			role := t.txnBlockList.GetRole(contract.Caller)
+			if role == addresslist.EnabledRole {
+				t.logger.Debug(
+					"Failing transaction. Caller is in the transaction blocklist",
+					"contract.Caller", contract.Caller,
+					"contract.Address", contract.Address,
+				)
+
+				return &runtime.ExecutionResult{
+					GasLeft: 0,
+					Err:     runtime.ErrNotAuth,
 				}
 			}
 		}
@@ -646,7 +750,12 @@ func (t *Transition) applyCall(
 
 	result = t.run(c, host)
 	if result.Failed() {
-		t.state.RevertToSnapshot(snapshot)
+		if err := t.state.RevertToSnapshot(snapshot); err != nil {
+			return &runtime.ExecutionResult{
+				GasLeft: c.Gas,
+				Err:     err,
+			}
+		}
 	}
 
 	t.captureCallEnd(c, result)
@@ -654,21 +763,14 @@ func (t *Transition) applyCall(
 	return result
 }
 
-var emptyHash types.Hash
-
 func (t *Transition) hasCodeOrNonce(addr types.Address) bool {
-	nonce := t.state.GetNonce(addr)
-	if nonce != 0 {
+	if t.state.GetNonce(addr) != 0 {
 		return true
 	}
 
 	codeHash := t.state.GetCodeHash(addr)
 
-	if codeHash != emptyCodeHashTwo && codeHash != emptyHash {
-		return true
-	}
-
-	return false
+	return codeHash != types.EmptyCodeHash && codeHash != types.ZeroHash
 }
 
 func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtime.ExecutionResult {
@@ -682,9 +784,11 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 	}
 
 	// Increment the nonce of the caller
-	t.state.IncrNonce(c.Caller)
+	if err := t.state.IncrNonce(c.Caller); err != nil {
+		return &runtime.ExecutionResult{Err: err}
+	}
 
-	// Check if there if there is a collision and the address already exists
+	// Check if there is a collision and the address already exists
 	if t.hasCodeOrNonce(c.Address) {
 		return &runtime.ExecutionResult{
 			GasLeft: 0,
@@ -698,7 +802,10 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 	if t.config.EIP158 {
 		// Force the creation of the account
 		t.state.CreateAccount(c.Address)
-		t.state.IncrNonce(c.Address)
+
+		if err := t.state.IncrNonce(c.Address); err != nil {
+			return &runtime.ExecutionResult{Err: err}
+		}
 	}
 
 	// Transfer the value
@@ -719,10 +826,31 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 	}()
 
 	// check if contract creation allow list is enabled
-	if t.deploymentAllowlist != nil {
-		role := t.deploymentAllowlist.GetRole(c.Caller)
+	if t.deploymentAllowList != nil {
+		role := t.deploymentAllowList.GetRole(c.Caller)
 
 		if !role.Enabled() {
+			t.logger.Debug(
+				"Failing contract deployment. Caller is not in the deployment allowlist",
+				"contract.Caller", c.Caller,
+				"contract.Address", c.Address,
+			)
+
+			return &runtime.ExecutionResult{
+				GasLeft: 0,
+				Err:     runtime.ErrNotAuth,
+			}
+		}
+	} else if t.deploymentBlockList != nil {
+		role := t.deploymentBlockList.GetRole(c.Caller)
+
+		if role == addresslist.EnabledRole {
+			t.logger.Debug(
+				"Failing contract deployment. Caller is in the deployment blocklist",
+				"contract.Caller", c.Caller,
+				"contract.Address", c.Address,
+			)
+
 			return &runtime.ExecutionResult{
 				GasLeft: 0,
 				Err:     runtime.ErrNotAuth,
@@ -732,14 +860,22 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 
 	result = t.run(c, host)
 	if result.Failed() {
-		t.state.RevertToSnapshot(snapshot)
+		if err := t.state.RevertToSnapshot(snapshot); err != nil {
+			return &runtime.ExecutionResult{
+				Err: err,
+			}
+		}
 
 		return result
 	}
 
 	if t.config.EIP158 && len(result.ReturnValue) > SpuriousDragonMaxCodeSize {
 		// Contract size exceeds 'SpuriousDragon' size limit
-		t.state.RevertToSnapshot(snapshot)
+		if err := t.state.RevertToSnapshot(snapshot); err != nil {
+			return &runtime.ExecutionResult{
+				Err: err,
+			}
+		}
 
 		return &runtime.ExecutionResult{
 			GasLeft: 0,
@@ -755,7 +891,11 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 
 		// Out of gas creating the contract
 		if t.config.Homestead {
-			t.state.RevertToSnapshot(snapshot)
+			if err := t.state.RevertToSnapshot(snapshot); err != nil {
+				return &runtime.ExecutionResult{
+					Err: err,
+				}
+			}
 
 			result.GasLeft = 0
 		}
@@ -768,6 +908,41 @@ func (t *Transition) applyCreate(c *runtime.Contract, host runtime.Host) *runtim
 	t.state.SetCode(c.Address, result.ReturnValue)
 
 	return result
+}
+
+func (t *Transition) handleAllowBlockListsUpdate(contract *runtime.Contract,
+	host runtime.Host) *runtime.ExecutionResult {
+	// check contract deployment allow list (if any)
+	if t.deploymentAllowList != nil && t.deploymentAllowList.Addr() == contract.CodeAddress {
+		return t.deploymentAllowList.Run(contract, host, &t.config)
+	}
+
+	// check contract deployment block list (if any)
+	if t.deploymentBlockList != nil && t.deploymentBlockList.Addr() == contract.CodeAddress {
+		return t.deploymentBlockList.Run(contract, host, &t.config)
+	}
+
+	// check bridge allow list (if any)
+	if t.bridgeAllowList != nil && t.bridgeAllowList.Addr() == contract.CodeAddress {
+		return t.bridgeAllowList.Run(contract, host, &t.config)
+	}
+
+	// check bridge block list (if any)
+	if t.bridgeBlockList != nil && t.bridgeBlockList.Addr() == contract.CodeAddress {
+		return t.bridgeBlockList.Run(contract, host, &t.config)
+	}
+
+	// check transaction allow list (if any)
+	if t.txnAllowList != nil && t.txnAllowList.Addr() == contract.CodeAddress {
+		return t.txnAllowList.Run(contract, host, &t.config)
+	}
+
+	// check transaction block list (if any)
+	if t.txnBlockList != nil && t.txnBlockList.Addr() == contract.CodeAddress {
+		return t.txnBlockList.Run(contract, host, &t.config)
+	}
+
+	return nil
 }
 
 func (t *Transition) SetState(addr types.Address, key types.Hash, value types.Hash) {
@@ -875,6 +1050,11 @@ func (t *Transition) SetCodeDirectly(addr types.Address, code []byte) error {
 	return nil
 }
 
+// SetNonPayable deactivates the check of tx cost against tx executor balance.
+func (t *Transition) SetNonPayable(nonPayable bool) {
+	t.ctx.NonPayable = nonPayable
+}
+
 // SetTracer sets tracer to the context in order to enable it
 func (t *Transition) SetTracer(tracer tracer.Tracer) {
 	t.ctx.Tracer = tracer
@@ -932,25 +1112,34 @@ func TransactionGasCost(msg *types.Transaction, isHomestead, isIstanbul bool) (u
 	return cost, nil
 }
 
-// checkAndProcessLegacyTx - first check if this message satisfies all consensus rules before
+// checkAndProcessTx - first check if this message satisfies all consensus rules before
 // applying the message. The rules include these clauses:
 // 1. the nonce of the message caller is correct
-// 2. caller has enough balance to cover transaction fee(gaslimit * gasprice)
-func checkAndProcessLegacyTx(msg *types.Transaction, t *Transition) error {
+// 2. caller has enough balance to cover transaction fee(gaslimit * gasprice * val) or fee(gasfeecap * gasprice * val)
+func checkAndProcessTx(msg *types.Transaction, t *Transition) error {
 	// 1. the nonce of the message caller is correct
 	if err := t.nonceCheck(msg); err != nil {
 		return NewTransitionApplicationError(err, true)
 	}
 
-	// 2. caller has enough balance to cover transaction fee(gaslimit * gasprice)
-	if err := t.subGasLimitPrice(msg); err != nil {
-		return NewTransitionApplicationError(err, true)
+	if !t.ctx.NonPayable {
+		// 2. check dynamic fees of the transaction
+		if err := t.checkDynamicFees(msg); err != nil {
+			return NewTransitionApplicationError(err, true)
+		}
+
+		// 3. caller has enough balance to cover transaction
+		// Skip this check if the given flag is provided.
+		// It happens for eth_call and for other operations that do not change the state.
+		if err := t.subGasLimitPrice(msg); err != nil {
+			return NewTransitionApplicationError(err, true)
+		}
 	}
 
 	return nil
 }
 
-func checkAndProcessStateTx(msg *types.Transaction, t *Transition) error {
+func checkAndProcessStateTx(msg *types.Transaction) error {
 	if msg.GasPrice.Cmp(big.NewInt(0)) != 0 {
 		return NewTransitionApplicationError(
 			errors.New("gasPrice of state transaction must be zero"),

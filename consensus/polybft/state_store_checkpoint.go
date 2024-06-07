@@ -3,20 +3,26 @@ package polybft
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+
+	"github.com/umbracle/ethgo"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/0xPolygon/polygon-edge/consensus/polybft/contractsapi"
 	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/types"
-	"github.com/umbracle/ethgo"
-	bolt "go.etcd.io/bbolt"
 )
 
 var (
 	// bucket to store exit contract events
-	exitEventsBucket             = []byte("exitEvent")
-	exitEventToEpochLookupBucket = []byte("exitIdToEpochLookup")
+	exitEventsBucket                  = []byte("exitEvent")
+	exitEventToEpochLookupBucket      = []byte("exitIdToEpochLookup")
+	exitEventLastProcessedBlockBucket = []byte("lastProcessedBlock")
+
+	lastProcessedBlockKey = []byte("lastProcessedBlock")
+	errNoLastSavedEntry   = errors.New("there is no last saved block in last saved bucket")
 )
 
 type exitEventNotFoundError struct {
@@ -28,12 +34,22 @@ func (e *exitEventNotFoundError) Error() string {
 	return fmt.Sprintf("could not find any exit event that has an id: %v and epoch: %v", e.exitID, e.epoch)
 }
 
+// ExitEvent is an event emitted by Exit contract
+type ExitEvent struct {
+	*contractsapi.L2StateSyncedEvent
+	// EpochNumber is the epoch number in which exit event was added
+	EpochNumber uint64 `abi:"-"`
+	// BlockNumber is the block in which exit event was added
+	BlockNumber uint64 `abi:"-"`
+}
+
 /*
 Bolt DB schema:
 
 exit events/
 |--> (id+epoch+blockNumber) -> *ExitEvent (json marshalled)
 |--> (exitEventID) -> epochNumber
+|--> (lastProcessedBlockKey) -> block number
 */
 type CheckpointStore struct {
 	db *bolt.DB
@@ -49,46 +65,40 @@ func (s *CheckpointStore) initialize(tx *bolt.Tx) error {
 		return fmt.Errorf("failed to create bucket=%s: %w", string(exitEventToEpochLookupBucket), err)
 	}
 
-	return nil
-}
-
-// insertExitEvents inserts a slice of exit events to exit event bucket in bolt db
-func (s *CheckpointStore) insertExitEvents(exitEvents []*ExitEvent) error {
-	if len(exitEvents) == 0 {
-		// small optimization
-		return nil
+	if _, err := tx.CreateBucketIfNotExists(exitEventLastProcessedBlockBucket); err != nil {
+		return fmt.Errorf("failed to create bucket=%s: %w", string(exitEventLastProcessedBlockBucket), err)
 	}
 
-	return s.db.Update(func(tx *bolt.Tx) error {
-		exitEventBucket := tx.Bucket(exitEventsBucket)
-		lookupBucket := tx.Bucket(exitEventToEpochLookupBucket)
-		for i := 0; i < len(exitEvents); i++ {
-			if err := insertExitEventToBucket(exitEventBucket, lookupBucket, exitEvents[i]); err != nil {
-				return err
-			}
+	return tx.Bucket(exitEventLastProcessedBlockBucket).Put(lastProcessedBlockKey, common.EncodeUint64ToBytes(0))
+}
+
+// insertExitEventWithTx inserts an exit event to db
+func (s *CheckpointStore) insertExitEvent(exitEvent *ExitEvent, dbTx *bolt.Tx) error {
+	insertFn := func(tx *bolt.Tx) error {
+		raw, err := json.Marshal(exitEvent)
+		if err != nil {
+			return err
 		}
 
-		return nil
-	})
-}
+		epochBytes := common.EncodeUint64ToBytes(exitEvent.EpochNumber)
+		exitIDBytes := common.EncodeUint64ToBytes(exitEvent.ID.Uint64())
 
-// insertExitEventToBucket inserts exit event to exit event bucket
-func insertExitEventToBucket(exitEventBucket, lookupBucket *bolt.Bucket, exitEvent *ExitEvent) error {
-	raw, err := json.Marshal(exitEvent)
-	if err != nil {
-		return err
+		err = tx.Bucket(exitEventsBucket).Put(bytes.Join([][]byte{epochBytes,
+			exitIDBytes, common.EncodeUint64ToBytes(exitEvent.BlockNumber)}, nil), raw)
+		if err != nil {
+			return err
+		}
+
+		return tx.Bucket(exitEventToEpochLookupBucket).Put(exitIDBytes, epochBytes)
 	}
 
-	epochBytes := common.EncodeUint64ToBytes(exitEvent.EpochNumber)
-	exitIDBytes := common.EncodeUint64ToBytes(exitEvent.ID)
-
-	err = exitEventBucket.Put(bytes.Join([][]byte{epochBytes,
-		exitIDBytes, common.EncodeUint64ToBytes(exitEvent.BlockNumber)}, nil), raw)
-	if err != nil {
-		return err
+	if dbTx == nil {
+		return s.db.Update(func(tx *bolt.Tx) error {
+			return insertFn(tx)
+		})
 	}
 
-	return lookupBucket.Put(exitIDBytes, epochBytes)
+	return insertFn(dbTx)
 }
 
 // getExitEvent returns exit event with given id, which happened in given epoch and given block number
@@ -162,10 +172,39 @@ func (s *CheckpointStore) getExitEvents(epoch uint64, filter func(exitEvent *Exi
 
 	// enforce sequential order
 	sort.Slice(events, func(i, j int) bool {
-		return events[i].ID < events[j].ID
+		return events[i].ID.Cmp(events[j].ID) < 0
 	})
 
 	return events, err
+}
+
+// updateLastSaved saves the last block processed for exit events
+func (s *CheckpointStore) getLastSaved(dbTx *bolt.Tx) (uint64, error) {
+	var (
+		lastSavedBlock uint64
+		err            error
+	)
+
+	getFn := func(tx *bolt.Tx) error {
+		v := tx.Bucket(exitEventLastProcessedBlockBucket).Get(lastProcessedBlockKey)
+		if v == nil {
+			return errNoLastSavedEntry
+		}
+
+		lastSavedBlock = common.EncodeBytesToUint64(v)
+
+		return nil
+	}
+
+	if dbTx == nil {
+		err = s.db.View(func(tx *bolt.Tx) error {
+			return getFn(tx)
+		})
+	} else {
+		err = getFn(dbTx)
+	}
+
+	return lastSavedBlock, err
 }
 
 // decodeExitEvent tries to decode exit event from the provided log
@@ -173,21 +212,18 @@ func decodeExitEvent(log *ethgo.Log, epoch, block uint64) (*ExitEvent, error) {
 	var l2StateSyncedEvent contractsapi.L2StateSyncedEvent
 
 	doesMatch, err := l2StateSyncedEvent.ParseLog(log)
-	if !doesMatch {
-		return nil, nil
-	}
-
 	if err != nil {
 		return nil, err
 	}
 
+	if !doesMatch {
+		return nil, nil
+	}
+
 	return &ExitEvent{
-		ID:          l2StateSyncedEvent.ID.Uint64(),
-		Sender:      ethgo.Address(l2StateSyncedEvent.Sender),
-		Receiver:    ethgo.Address(l2StateSyncedEvent.Receiver),
-		Data:        l2StateSyncedEvent.Data,
-		EpochNumber: epoch,
-		BlockNumber: block,
+		L2StateSyncedEvent: &l2StateSyncedEvent,
+		EpochNumber:        epoch,
+		BlockNumber:        block,
 	}, nil
 }
 
@@ -195,9 +231,11 @@ func decodeExitEvent(log *ethgo.Log, epoch, block uint64) (*ExitEvent, error) {
 func convertLog(log *types.Log) *ethgo.Log {
 	l := &ethgo.Log{
 		Address: ethgo.Address(log.Address),
-		Data:    log.Data,
+		Data:    make([]byte, len(log.Data)),
 		Topics:  make([]ethgo.Hash, len(log.Topics)),
 	}
+
+	copy(l.Data, log.Data)
 
 	for i, topic := range log.Topics {
 		l.Topics[i] = ethgo.Hash(topic)

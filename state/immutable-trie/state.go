@@ -42,11 +42,15 @@ func (s *State) newTrie() *Trie {
 	return NewTrie()
 }
 
-func (s *State) SetCode(hash types.Hash, code []byte) {
-	s.storage.SetCode(hash, code)
+func (s *State) SetCode(hash types.Hash, code []byte) error {
+	return s.storage.SetCode(hash, code)
 }
 
 func (s *State) GetCode(hash types.Hash) ([]byte, bool) {
+	if hash == types.EmptyCodeHash {
+		return []byte{}, true
+	}
+
 	return s.storage.GetCode(hash)
 }
 

@@ -7,18 +7,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/0xPolygon/polygon-edge/blockchain"
-	"github.com/0xPolygon/polygon-edge/chain"
-	"github.com/0xPolygon/polygon-edge/network"
-	"github.com/0xPolygon/polygon-edge/state"
-	"github.com/0xPolygon/polygon-edge/state/runtime"
-	"github.com/0xPolygon/polygon-edge/txpool/proto"
-	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/armon/go-metrics"
 	"github.com/golang/protobuf/ptypes/any"
 	"github.com/hashicorp/go-hclog"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"google.golang.org/grpc"
+
+	"github.com/0xPolygon/polygon-edge/blockchain"
+	"github.com/0xPolygon/polygon-edge/chain"
+	"github.com/0xPolygon/polygon-edge/forkmanager"
+	"github.com/0xPolygon/polygon-edge/network"
+	"github.com/0xPolygon/polygon-edge/state"
+	"github.com/0xPolygon/polygon-edge/state/runtime"
+	"github.com/0xPolygon/polygon-edge/txpool/proto"
+	"github.com/0xPolygon/polygon-edge/types"
 )
 
 const (
@@ -55,8 +57,14 @@ var (
 	ErrOversizedData           = errors.New("oversized data")
 	ErrMaxEnqueuedLimitReached = errors.New("maximum number of enqueued transactions reached")
 	ErrRejectFutureTx          = errors.New("rejected future tx due to low slots")
-	ErrSmartContractRestricted = errors.New("smart contract deployment restricted")
 	ErrInvalidTxType           = errors.New("invalid tx type")
+	ErrTxTypeNotSupported      = types.ErrTxTypeNotSupported
+	ErrTipAboveFeeCap          = errors.New("max priority fee per gas higher than max fee per gas")
+	ErrTipVeryHigh             = errors.New("max priority fee per gas higher than 2^256-1")
+	ErrFeeCapVeryHigh          = errors.New("max fee per gas higher than 2^256-1")
+	ErrNonceExistsInPool       = errors.New("tx with the same nonce is already present")
+	ErrReplacementUnderpriced  = errors.New("replacement tx underpriced")
+	ErrDynamicTxNotAllowed     = errors.New("dynamic tx not allowed currently")
 )
 
 // indicates origin of a transaction
@@ -84,6 +92,7 @@ type store interface {
 	GetNonce(root types.Hash, addr types.Address) uint64
 	GetBalance(root types.Hash, addr types.Address) (*big.Int, error)
 	GetBlockByHash(types.Hash, bool) (*types.Block, bool)
+	CalculateBaseFee(parent *types.Header) uint64
 }
 
 type signer interface {
@@ -91,10 +100,10 @@ type signer interface {
 }
 
 type Config struct {
-	PriceLimit          uint64
-	MaxSlots            uint64
-	MaxAccountEnqueued  uint64
-	DeploymentWhitelist []types.Address
+	PriceLimit         uint64
+	MaxSlots           uint64
+	MaxAccountEnqueued uint64
+	ChainID            *big.Int
 }
 
 /* All requests are passed to the main loop
@@ -137,7 +146,7 @@ type promoteRequest struct {
 type TxPool struct {
 	logger hclog.Logger
 	signer signer
-	forks  chain.ForksInTime
+	forks  *chain.Forks
 	store  store
 
 	// map of all accounts registered by the pool
@@ -161,7 +170,6 @@ type TxPool struct {
 
 	// channels on which the pool's event loop
 	// does dispatching/handling requests.
-	enqueueReqCh chan enqueueRequest
 	promoteReqCh chan promoteRequest
 	pruneCh      chan struct{}
 
@@ -170,13 +178,14 @@ type TxPool struct {
 
 	// flag indicating if the current node is a sealer,
 	// and should therefore gossip transactions
-	sealing uint32
+	sealing atomic.Bool
+
+	// baseFee is the base fee of the current head.
+	// This is needed to sort transactions by price
+	baseFee uint64
 
 	// Event manager for txpool events
 	eventManager *eventManager
-
-	// deploymentWhitelist map
-	deploymentWhitelist deploymentWhitelist
 
 	// indicates which txpool operator commands should be implemented
 	proto.UnimplementedTxnPoolOperatorServer
@@ -184,47 +193,15 @@ type TxPool struct {
 	// pending is the list of pending and ready transactions. This variable
 	// is accessed with atomics
 	pending int64
-}
 
-// deploymentWhitelist map which contains all addresses which can deploy contracts
-// if empty anyone can
-type deploymentWhitelist struct {
-	// Contract deployment whitelist
-	addresses map[string]bool
-}
-
-// add an address to deploymentWhitelist map
-func (w *deploymentWhitelist) add(addr types.Address) {
-	w.addresses[addr.String()] = true
-}
-
-// allowed checks if address can deploy smart contract
-func (w *deploymentWhitelist) allowed(addr types.Address) bool {
-	if len(w.addresses) == 0 {
-		return true
-	}
-
-	_, ok := w.addresses[addr.String()]
-
-	return ok
-}
-
-func newDeploymentWhitelist(deploymentWhitelistRaw []types.Address) deploymentWhitelist {
-	deploymentWhitelist := deploymentWhitelist{
-		addresses: map[string]bool{},
-	}
-
-	for _, addr := range deploymentWhitelistRaw {
-		deploymentWhitelist.add(addr)
-	}
-
-	return deploymentWhitelist
+	// chain id
+	chainID *big.Int
 }
 
 // NewTxPool returns a new pool for processing incoming transactions.
 func NewTxPool(
 	logger hclog.Logger,
-	forks chain.ForksInTime,
+	forks *chain.Forks,
 	store store,
 	grpcServer *grpc.Server,
 	network *network.Server,
@@ -234,14 +211,14 @@ func NewTxPool(
 		logger:      logger.Named("txpool"),
 		forks:       forks,
 		store:       store,
-		executables: newPricedQueue(),
+		executables: newPricesQueue(0, nil),
 		accounts:    accountsMap{maxEnqueuedLimit: config.MaxAccountEnqueued},
 		index:       lookupMap{all: make(map[types.Hash]*types.Transaction)},
 		gauge:       slotGauge{height: 0, max: config.MaxSlots},
 		priceLimit:  config.PriceLimit,
+		chainID:     config.ChainID,
 
 		//	main loop channels
-		enqueueReqCh: make(chan enqueueRequest),
 		promoteReqCh: make(chan promoteRequest),
 		pruneCh:      make(chan struct{}),
 		shutdownCh:   make(chan struct{}),
@@ -263,9 +240,6 @@ func NewTxPool(
 
 		pool.topic = topic
 	}
-
-	// initialize deployment whitelist
-	pool.deploymentWhitelist = newDeploymentWhitelist(config.DeploymentWhitelist)
 
 	if grpcServer != nil {
 		proto.RegisterTxnPoolOperatorServer(grpcServer, pool)
@@ -308,8 +282,6 @@ func (p *TxPool) Start() {
 			select {
 			case <-p.shutdownCh:
 				return
-			case req := <-p.enqueueReqCh:
-				go p.handleEnqueueRequest(req)
 			case req := <-p.promoteReqCh:
 				go p.handlePromoteRequest(req)
 			}
@@ -320,7 +292,7 @@ func (p *TxPool) Start() {
 // Close shuts down the pool's main loop.
 func (p *TxPool) Close() {
 	p.eventManager.Close()
-	p.shutdownCh <- struct{}{}
+	close(p.shutdownCh)
 }
 
 // SetSigner sets the signer the pool will use
@@ -331,21 +303,7 @@ func (p *TxPool) SetSigner(s signer) {
 
 // SetSealing sets the sealing flag
 func (p *TxPool) SetSealing(sealing bool) {
-	newValue := uint32(0)
-	if sealing {
-		newValue = 1
-	}
-
-	atomic.CompareAndSwapUint32(
-		&p.sealing,
-		p.sealing,
-		newValue,
-	)
-}
-
-// sealing returns the current set sealing flag
-func (p *TxPool) getSealing() bool {
-	return atomic.LoadUint32(&p.sealing) == 1
+	p.sealing.CompareAndSwap(p.sealing.Load(), sealing)
 }
 
 // AddTx adds a new transaction to the pool (sent from json-RPC/gRPC endpoints)
@@ -377,18 +335,11 @@ func (p *TxPool) AddTx(tx *types.Transaction) error {
 // Prepare generates all the transactions
 // ready for execution. (primaries)
 func (p *TxPool) Prepare() {
-	// clear from previous round
-	if p.executables.length() != 0 {
-		p.executables.clear()
-	}
-
 	// fetch primary from each account
 	primaries := p.accounts.getPrimaries()
 
-	// push primaries to the executables queue
-	for _, tx := range primaries {
-		p.executables.push(tx)
-	}
+	// create new executables queue with base fee and initial transactions (primaries)
+	p.executables = newPricesQueue(p.GetBaseFee(), primaries)
 }
 
 // Peek returns the best-price selected
@@ -412,10 +363,18 @@ func (p *TxPool) Pop(tx *types.Transaction) {
 	account := p.accounts.get(tx.From)
 
 	account.promoted.lock(true)
-	defer account.promoted.unlock()
+	account.nonceToTx.lock()
+
+	defer func() {
+		account.nonceToTx.unlock()
+		account.promoted.unlock()
+	}()
 
 	// pop the top most promoted tx
 	account.promoted.pop()
+
+	// update the account nonce -> *tx map
+	account.nonceToTx.remove(tx)
 
 	// successfully popping an account resets its demotions count to 0
 	account.resetDemotions()
@@ -435,11 +394,23 @@ func (p *TxPool) Pop(tx *types.Transaction) {
 // Drop clears the entire account associated with the given transaction
 // and reverts its next (expected) nonce.
 func (p *TxPool) Drop(tx *types.Transaction) {
-	// fetch associated account
 	account := p.accounts.get(tx.From)
+	p.dropAccount(account, tx.Nonce, tx)
+}
 
+// dropAccount clears all promoted and enqueued tx from the account
+// signals EventType_DROPPED for provided hash, clears all the slots and metrics
+// and sets nonce to provided nonce
+func (p *TxPool) dropAccount(account *account, nextNonce uint64, tx *types.Transaction) {
 	account.promoted.lock(true)
 	account.enqueued.lock(true)
+	account.nonceToTx.lock()
+
+	defer func() {
+		account.nonceToTx.unlock()
+		account.enqueued.unlock()
+		account.promoted.unlock()
+	}()
 
 	// num of all txs dropped
 	droppedCount := 0
@@ -453,14 +424,11 @@ func (p *TxPool) Drop(tx *types.Transaction) {
 		droppedCount += len(txs)
 	}
 
-	defer func() {
-		account.enqueued.unlock()
-		account.promoted.unlock()
-	}()
-
 	// rollback nonce
-	nextNonce := tx.Nonce
 	account.setNonce(nextNonce)
+
+	// reset accounts nonce map
+	account.nonceToTx.reset()
 
 	// drop promoted
 	dropped := account.promoted.clear()
@@ -474,11 +442,14 @@ func (p *TxPool) Drop(tx *types.Transaction) {
 	clearAccountQueue(dropped)
 
 	p.eventManager.signalEvent(proto.EventType_DROPPED, tx.Hash)
-	p.logger.Debug("dropped account txs",
-		"num", droppedCount,
-		"next_nonce", nextNonce,
-		"address", tx.From.String(),
-	)
+
+	if p.logger.IsDebug() {
+		p.logger.Debug("dropped account txs",
+			"num", droppedCount,
+			"next_nonce", nextNonce,
+			"address", tx.From.String(),
+		)
+	}
 }
 
 // Demote excludes an account from being further processed during block building
@@ -487,10 +458,12 @@ func (p *TxPool) Drop(tx *types.Transaction) {
 func (p *TxPool) Demote(tx *types.Transaction) {
 	account := p.accounts.get(tx.From)
 	if account.Demotions() >= maxAccountDemotions {
-		p.logger.Debug(
-			"Demote: threshold reached - dropping account",
-			"addr", tx.From.String(),
-		)
+		if p.logger.IsDebug() {
+			p.logger.Debug(
+				"Demote: threshold reached - dropping account",
+				"addr", tx.From.String(),
+			)
+		}
 
 		p.Drop(tx)
 
@@ -515,7 +488,7 @@ func (p *TxPool) ResetWithHeaders(headers ...*types.Header) {
 	})
 }
 
-// processEvent collects the latest nonces for each account containted
+// processEvent collects the latest nonces for each account contained
 // in the received event. Resets all known accounts with the new nonce.
 func (p *TxPool) processEvent(event *blockchain.Event) {
 	// Grab the latest state root now that the block has been inserted
@@ -563,10 +536,15 @@ func (p *TxPool) processEvent(event *blockchain.Event) {
 		}
 	}
 
+	// update base fee
+	if ln := len(event.NewChain); ln > 0 {
+		p.SetBaseFee(event.NewChain[ln-1])
+	}
+
 	// reset accounts with the new state
 	p.resetAccounts(stateNonces)
 
-	if !p.getSealing() {
+	if !p.sealing.Load() {
 		// only non-validator cleanup inactive accounts
 		p.updateAccountSkipsCounts(stateNonces)
 	}
@@ -577,16 +555,23 @@ func (p *TxPool) processEvent(event *blockchain.Event) {
 func (p *TxPool) validateTx(tx *types.Transaction) error {
 	// Check the transaction type. State transactions are not expected to be added to the pool
 	if tx.Type == types.StateTx {
-		return ErrInvalidTxType
+		metrics.IncrCounter([]string{txPoolMetrics, "invalid_tx_type"}, 1)
+
+		return fmt.Errorf("%w: type %d rejected, state transactions are not expected to be added to the pool",
+			ErrInvalidTxType, tx.Type)
 	}
 
 	// Check the transaction size to overcome DOS Attacks
 	if uint64(len(tx.MarshalRLP())) > txMaxSize {
+		metrics.IncrCounter([]string{txPoolMetrics, "oversized_data_txs"}, 1)
+
 		return ErrOversizedData
 	}
 
 	// Check if the transaction has a strictly positive value
 	if tx.Value.Sign() < 0 {
+		metrics.IncrCounter([]string{txPoolMetrics, "negative_value_tx"}, 1)
+
 		return ErrNegativeValue
 	}
 
@@ -595,6 +580,8 @@ func (p *TxPool) validateTx(tx *types.Transaction) error {
 	// Extract the sender
 	from, signerErr := p.signer.Sender(tx)
 	if signerErr != nil {
+		metrics.IncrCounter([]string{txPoolMetrics, "invalid_signature_txs"}, 1)
+
 		return ErrExtractSignature
 	}
 
@@ -602,6 +589,8 @@ func (p *TxPool) validateTx(tx *types.Transaction) error {
 	// it matches the signer
 	if tx.From != types.ZeroAddress &&
 		tx.From != from {
+		metrics.IncrCounter([]string{txPoolMetrics, "invalid_sender_txs"}, 1)
+
 		return ErrInvalidSender
 	}
 
@@ -610,54 +599,126 @@ func (p *TxPool) validateTx(tx *types.Transaction) error {
 		tx.From = from
 	}
 
+	// Grab current block number
+	currentHeader := p.store.Header()
+	currentBlockNumber := currentHeader.Number
+
+	// Get forks state for the current block
+	forks := p.forks.At(currentBlockNumber)
+
 	// Check if transaction can deploy smart contract
-	if tx.IsContractCreation() {
-		if !p.deploymentWhitelist.allowed(tx.From) {
-			return ErrSmartContractRestricted
+	if tx.IsContractCreation() && forks.EIP158 && len(tx.Input) > state.TxPoolMaxInitCodeSize {
+		metrics.IncrCounter([]string{txPoolMetrics, "contract_deploy_too_large_txs"}, 1)
+
+		return runtime.ErrMaxCodeSizeExceeded
+	}
+
+	// Grab the state root, and block gas limit for the latest block
+	stateRoot := currentHeader.StateRoot
+	latestBlockGasLimit := currentHeader.GasLimit
+	baseFee := p.GetBaseFee() // base fee is calculated for the next block
+
+	if tx.Type == types.DynamicFeeTx {
+		// Reject dynamic fee tx if london hardfork is not enabled
+		if !forks.London {
+			metrics.IncrCounter([]string{txPoolMetrics, "tx_type"}, 1)
+
+			return fmt.Errorf("%w: type %d rejected, london hardfork is not enabled", ErrTxTypeNotSupported, tx.Type)
 		}
 
-		if p.forks.EIP158 && len(tx.Input) > state.TxPoolMaxInitCodeSize {
-			return runtime.ErrMaxCodeSizeExceeded
+		// DynamicFeeTx should be rejected if TxHashWithType fork is registered but not enabled for current block
+		blockNumber, err := forkmanager.GetInstance().GetForkBlock(chain.TxHashWithType)
+		if err == nil && blockNumber > currentBlockNumber {
+			metrics.IncrCounter([]string{txPoolMetrics, "dynamic_tx_not_allowed"}, 1)
+
+			return ErrDynamicTxNotAllowed
+		}
+
+		// Check EIP-1559-related fields and make sure they are correct
+		if tx.GasFeeCap == nil || tx.GasTipCap == nil {
+			metrics.IncrCounter([]string{txPoolMetrics, "underpriced_tx"}, 1)
+
+			return ErrUnderpriced
+		}
+
+		if tx.GasFeeCap.BitLen() > 256 {
+			metrics.IncrCounter([]string{txPoolMetrics, "fee_cap_too_high_dynamic_tx"}, 1)
+
+			return ErrFeeCapVeryHigh
+		}
+
+		if tx.GasTipCap.BitLen() > 256 {
+			metrics.IncrCounter([]string{txPoolMetrics, "tip_too_high_dynamic_tx"}, 1)
+
+			return ErrTipVeryHigh
+		}
+
+		if tx.GasFeeCap.Cmp(tx.GasTipCap) < 0 {
+			metrics.IncrCounter([]string{txPoolMetrics, "tip_above_fee_cap_dynamic_tx"}, 1)
+
+			return ErrTipAboveFeeCap
+		}
+
+		// Reject underpriced transactions
+		if tx.GasFeeCap.Cmp(new(big.Int).SetUint64(baseFee)) < 0 {
+			metrics.IncrCounter([]string{txPoolMetrics, "underpriced_tx"}, 1)
+
+			return ErrUnderpriced
+		}
+	} else {
+		// Legacy approach to check if the given tx is not underpriced when london hardfork is enabled
+		if forks.London && tx.GasPrice.Cmp(new(big.Int).SetUint64(baseFee)) < 0 {
+			metrics.IncrCounter([]string{txPoolMetrics, "underpriced_tx"}, 1)
+
+			return ErrUnderpriced
 		}
 	}
 
-	// Reject underpriced transactions
-	if tx.IsUnderpriced(p.priceLimit) {
+	// Check if the given tx is not underpriced
+	if tx.GetGasPrice(baseFee).Cmp(new(big.Int).SetUint64(p.priceLimit)) < 0 {
+		metrics.IncrCounter([]string{txPoolMetrics, "underpriced_tx"}, 1)
+
 		return ErrUnderpriced
 	}
 
-	// Grab the state root for the latest block
-	stateRoot := p.store.Header().StateRoot
-
 	// Check nonce ordering
 	if p.store.GetNonce(stateRoot, tx.From) > tx.Nonce {
+		metrics.IncrCounter([]string{txPoolMetrics, "nonce_too_low_tx"}, 1)
+
 		return ErrNonceTooLow
 	}
 
 	accountBalance, balanceErr := p.store.GetBalance(stateRoot, tx.From)
 	if balanceErr != nil {
+		metrics.IncrCounter([]string{txPoolMetrics, "invalid_account_state_tx"}, 1)
+
 		return ErrInvalidAccountState
 	}
 
 	// Check if the sender has enough funds to execute the transaction
 	if accountBalance.Cmp(tx.Cost()) < 0 {
+		metrics.IncrCounter([]string{txPoolMetrics, "insufficient_funds_tx"}, 1)
+
 		return ErrInsufficientFunds
 	}
 
 	// Make sure the transaction has more gas than the basic transaction fee
-	intrinsicGas, err := state.TransactionGasCost(tx, p.forks.Homestead, p.forks.Istanbul)
+	intrinsicGas, err := state.TransactionGasCost(tx, forks.Homestead, forks.Istanbul)
 	if err != nil {
+		metrics.IncrCounter([]string{txPoolMetrics, "invalid_intrinsic_gas_tx"}, 1)
+
 		return err
 	}
 
 	if tx.Gas < intrinsicGas {
+		metrics.IncrCounter([]string{txPoolMetrics, "intrinsic_gas_low_tx"}, 1)
+
 		return ErrIntrinsicGas
 	}
 
-	// Grab the block gas limit for the latest block
-	latestBlockGasLimit := p.store.Header().GasLimit
-
 	if tx.Gas > latestBlockGasLimit {
+		metrics.IncrCounter([]string{txPoolMetrics, "block_gas_limit_exceeded_tx"}, 1)
+
 		return ErrBlockLimitExceeded
 	}
 
@@ -679,6 +740,9 @@ func (p *TxPool) pruneAccountsWithNonceHoles() {
 			account.enqueued.lock(true)
 			defer account.enqueued.unlock()
 
+			account.nonceToTx.lock()
+			defer account.nonceToTx.unlock()
+
 			firstTx := account.enqueued.peek()
 
 			if firstTx == nil {
@@ -691,6 +755,7 @@ func (p *TxPool) pruneAccountsWithNonceHoles() {
 
 			removed := account.enqueued.clear()
 
+			account.nonceToTx.remove(removed...)
 			p.index.remove(removed...)
 			p.gauge.decrease(slotsRequired(removed...))
 
@@ -704,81 +769,134 @@ func (p *TxPool) pruneAccountsWithNonceHoles() {
 // successful, an account is created for this address
 // (only once) and an enqueueRequest is signaled.
 func (p *TxPool) addTx(origin txOrigin, tx *types.Transaction) error {
-	p.logger.Debug("add tx",
-		"origin", origin.String(),
-		"hash", tx.Hash.String(),
-	)
+	if p.logger.IsDebug() {
+		p.logger.Debug("add tx", "origin", origin.String(), "hash", tx.Hash.String())
+	}
 
 	// validate incoming tx
 	if err := p.validateTx(tx); err != nil {
 		return err
 	}
 
+	// add chainID to the tx - only dynamic fee tx
+	if tx.Type == types.DynamicFeeTx {
+		tx.ChainID = p.chainID
+	}
+
+	// calculate tx hash
+	tx.ComputeHash(p.store.Header().Number)
+
+	// initialize account for this address once or retrieve existing one
+	account := p.getOrCreateAccount(tx.From)
+
+	account.promoted.lock(true)
+	account.enqueued.lock(true)
+	account.nonceToTx.lock()
+
+	defer func() {
+		account.nonceToTx.unlock()
+		account.enqueued.unlock()
+		account.promoted.unlock()
+	}()
+
+	accountNonce := account.getNonce()
+
+	//	only accept transactions with expected nonce
 	if p.gauge.highPressure() {
 		p.signalPruning()
 
-		//	only accept transactions with expected nonce
-		if account := p.accounts.get(tx.From); account != nil &&
-			tx.Nonce > account.getNonce() {
+		if tx.Nonce > accountNonce {
+			metrics.IncrCounter([]string{txPoolMetrics, "rejected_future_tx"}, 1)
+
 			return ErrRejectFutureTx
 		}
 	}
 
-	// check for overflow
-	if slotsRequired(tx) > p.gauge.max-p.gauge.read() {
-		return ErrTxPoolOverflow
+	// try to find if there is transaction with same nonce for this account
+	oldTxWithSameNonce := account.nonceToTx.get(tx.Nonce)
+	if oldTxWithSameNonce != nil {
+		if oldTxWithSameNonce.Hash == tx.Hash {
+			metrics.IncrCounter([]string{txPoolMetrics, "already_known_tx"}, 1)
+
+			return ErrAlreadyKnown
+		} else if oldTxWithSameNonce.GetGasPrice(p.baseFee).Cmp(
+			tx.GetGasPrice(p.baseFee)) >= 0 {
+			// if tx with same nonce does exist and has same or better gas price -> return error
+			metrics.IncrCounter([]string{txPoolMetrics, "underpriced_tx"}, 1)
+
+			return ErrReplacementUnderpriced
+		}
+	} else {
+		if account.enqueued.length() == account.maxEnqueued && tx.Nonce != accountNonce {
+			return ErrMaxEnqueuedLimitReached
+		}
+
+		// reject low nonce tx
+		if tx.Nonce < accountNonce {
+			metrics.IncrCounter([]string{txPoolMetrics, "nonce_too_low_tx"}, 1)
+
+			return ErrNonceTooLow
+		}
 	}
 
-	tx.ComputeHash()
+	slotsAllocated := slotsRequired(tx)
+
+	var slotsFreed uint64
+	if oldTxWithSameNonce != nil {
+		slotsFreed = slotsRequired(oldTxWithSameNonce)
+	}
+
+	var slotsIncreased uint64
+	if slotsAllocated > slotsFreed {
+		slotsIncreased = slotsAllocated - slotsFreed
+		if !p.gauge.increaseWithinLimit(slotsIncreased) {
+			return ErrTxPoolOverflow
+		}
+	}
 
 	// add to index
 	if ok := p.index.add(tx); !ok {
+		metrics.IncrCounter([]string{txPoolMetrics, "already_known_tx"}, 1)
+
+		if slotsIncreased > 0 {
+			p.gauge.decrease(slotsIncreased)
+		}
+
 		return ErrAlreadyKnown
 	}
 
-	// initialize account for this address once
-	p.createAccountOnce(tx.From)
+	if slotsFreed > slotsAllocated {
+		p.gauge.decrease(slotsFreed - slotsAllocated)
+	}
 
-	// send request [BLOCKING]
-	p.enqueueReqCh <- enqueueRequest{tx: tx}
-	p.eventManager.signalEvent(proto.EventType_ADDED, tx.Hash)
+	if oldTxWithSameNonce != nil {
+		p.index.remove(oldTxWithSameNonce)
+	} else {
+		metrics.SetGauge([]string{txPoolMetrics, "added_tx"}, 1)
+	}
+
+	account.enqueue(tx, oldTxWithSameNonce != nil) // add or replace tx into account
+
+	go p.invokePromotion(tx, tx.Nonce <= accountNonce) // don't signal promotion for higher nonce txs
 
 	return nil
 }
 
-// handleEnqueueRequest attempts to enqueue the transaction
-// contained in the given request to the associated account.
-// If, afterwards, the account is eligible for promotion,
-// a promoteRequest is signaled.
-func (p *TxPool) handleEnqueueRequest(req enqueueRequest) {
-	tx := req.tx
-	addr := req.tx.From
+func (p *TxPool) invokePromotion(tx *types.Transaction, callPromote bool) {
+	p.eventManager.signalEvent(proto.EventType_ADDED, tx.Hash)
 
-	// fetch account
-	account := p.accounts.get(addr)
-
-	// enqueue tx
-	if err := account.enqueue(tx); err != nil {
-		p.logger.Error("enqueue request", "err", err)
-
-		p.index.remove(tx)
-
-		return
+	if p.logger.IsDebug() {
+		p.logger.Debug("enqueue request", "hash", tx.Hash.String())
 	}
-
-	p.logger.Debug("enqueue request", "hash", tx.Hash.String())
-
-	p.gauge.increase(slotsRequired(tx))
 
 	p.eventManager.signalEvent(proto.EventType_ENQUEUED, tx.Hash)
 
-	if tx.Nonce > account.getNonce() {
-		// don't signal promotion for
-		// higher nonce txs
-		return
+	if callPromote {
+		select {
+		case <-p.shutdownCh:
+		case p.promoteReqCh <- promoteRequest{account: tx.From}: // BLOCKING
+		}
 	}
-
-	p.promoteReqCh <- promoteRequest{account: addr} // BLOCKING
 }
 
 // handlePromoteRequest handles moving promotable transactions
@@ -790,7 +908,9 @@ func (p *TxPool) handlePromoteRequest(req promoteRequest) {
 
 	// promote enqueued txs
 	promoted, pruned := account.promote()
-	p.logger.Debug("promote request", "promoted", promoted, "addr", addr.String())
+	if p.logger.IsDebug() {
+		p.logger.Debug("promote request", "promoted", promoted, "addr", addr.String())
+	}
 
 	p.index.remove(pruned...)
 	p.gauge.decrease(slotsRequired(pruned...))
@@ -804,7 +924,7 @@ func (p *TxPool) handlePromoteRequest(req promoteRequest) {
 // addGossipTx handles receiving transactions
 // gossiped by the network.
 func (p *TxPool) addGossipTx(obj interface{}, _ peer.ID) {
-	if !p.getSealing() {
+	if !p.sealing.Load() {
 		return
 	}
 
@@ -834,7 +954,9 @@ func (p *TxPool) addGossipTx(obj interface{}, _ peer.ID) {
 	// add tx
 	if err := p.addTx(gossip, tx); err != nil {
 		if errors.Is(err, ErrAlreadyKnown) {
-			p.logger.Debug("rejecting known tx (gossip)", "hash", tx.Hash.String())
+			if p.logger.IsDebug() {
+				p.logger.Debug("rejecting known tx (gossip)", "hash", tx.Hash.String())
+			}
 
 			return
 		}
@@ -904,6 +1026,7 @@ func (p *TxPool) resetAccounts(stateNonces map[types.Address]uint64) {
 // updateAccountSkipsCounts update the accounts' skips,
 // the number of the consecutive blocks that doesn't have the account's transactions
 func (p *TxPool) updateAccountSkipsCounts(latestActiveAccounts map[types.Address]uint64) {
+	stateRoot := p.store.Header().StateRoot
 	p.accounts.Range(
 		func(key, value interface{}) bool {
 			address, _ := key.(types.Address)
@@ -922,14 +1045,13 @@ func (p *TxPool) updateAccountSkipsCounts(latestActiveAccounts map[types.Address
 				return true
 			}
 
-			account.incrementSkips()
-
-			if account.skips < maxAccountSkips {
+			if account.incrementSkips() < maxAccountSkips {
 				return true
 			}
 
 			// account has been skipped too many times
-			p.Drop(firstTx)
+			nextNonce := p.store.GetNonce(stateRoot, firstTx.From)
+			p.dropAccount(account, nextNonce, firstTx)
 
 			account.resetSkips()
 
@@ -938,11 +1060,11 @@ func (p *TxPool) updateAccountSkipsCounts(latestActiveAccounts map[types.Address
 	)
 }
 
-// createAccountOnce creates an account and
+// getOrCreateAccount creates an account and
 // ensures it is only initialized once.
-func (p *TxPool) createAccountOnce(newAddr types.Address) *account {
-	if p.accounts.exists(newAddr) {
-		return nil
+func (p *TxPool) getOrCreateAccount(newAddr types.Address) *account {
+	if account := p.accounts.get(newAddr); account != nil {
+		return account
 	}
 
 	// fetch nonce from state

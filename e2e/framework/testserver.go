@@ -21,17 +21,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/0xPolygon/polygon-edge/chain"
-	"github.com/0xPolygon/polygon-edge/command/genesis/predeploy"
+	"github.com/hashicorp/go-hclog"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/umbracle/ethgo"
+	"github.com/umbracle/ethgo/jsonrpc"
+	"github.com/umbracle/ethgo/wallet"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	empty "google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/0xPolygon/polygon-edge/chain"
 	"github.com/0xPolygon/polygon-edge/command"
 	"github.com/0xPolygon/polygon-edge/command/genesis"
+	"github.com/0xPolygon/polygon-edge/command/genesis/predeploy"
 	ibftSwitch "github.com/0xPolygon/polygon-edge/command/ibft/switch"
 	initCmd "github.com/0xPolygon/polygon-edge/command/secrets/init"
 	"github.com/0xPolygon/polygon-edge/command/server"
 	"github.com/0xPolygon/polygon-edge/consensus/ibft/fork"
 	ibftOp "github.com/0xPolygon/polygon-edge/consensus/ibft/proto"
 	"github.com/0xPolygon/polygon-edge/crypto"
+	"github.com/0xPolygon/polygon-edge/helper/common"
 	stakingHelper "github.com/0xPolygon/polygon-edge/helper/staking"
 	"github.com/0xPolygon/polygon-edge/helper/tests"
 	"github.com/0xPolygon/polygon-edge/network"
@@ -41,14 +50,6 @@ import (
 	txpoolProto "github.com/0xPolygon/polygon-edge/txpool/proto"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/0xPolygon/polygon-edge/validators"
-	"github.com/hashicorp/go-hclog"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/umbracle/ethgo"
-	"github.com/umbracle/ethgo/jsonrpc"
-	"github.com/umbracle/ethgo/wallet"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	empty "google.golang.org/protobuf/types/known/emptypb"
 )
 
 type TestServerConfigCallback func(*TestServerConfig)
@@ -83,7 +84,7 @@ func NewTestServer(t *testing.T, rootDir string, callback TestServerConfigCallba
 		LibP2PPort:    ports[1].Port(),
 		JSONRPCPort:   ports[2].Port(),
 		RootDir:       rootDir,
-		Signer:        crypto.NewEIP155Signer(chain.AllForksEnabled.At(0), 100),
+		Signer:        crypto.NewSigner(chain.AllForksEnabled.At(0), 100),
 		ValidatorType: validators.ECDSAValidatorType,
 	}
 
@@ -243,13 +244,13 @@ func (t *TestServer) SecretsInit() (*InitIBFTResult, error) {
 
 	if t.Config.ValidatorType == validators.BLSValidatorType {
 		// Generate the BLS Key
-		_, bksKeyEncoded, keyErr := crypto.GenerateAndEncodeBLSSecretKey()
+		_, blsKeyEncoded, keyErr := crypto.GenerateAndEncodeBLSSecretKey()
 		if keyErr != nil {
 			return nil, keyErr
 		}
 
 		// Write the networking private key to the secrets manager storage
-		if setErr := localSecretsManager.SetSecret(secrets.ValidatorBLSKey, bksKeyEncoded); setErr != nil {
+		if setErr := localSecretsManager.SetSecret(secrets.ValidatorBLSKey, blsKeyEncoded); setErr != nil {
 			return nil, setErr
 		}
 	}
@@ -277,6 +278,13 @@ func (t *TestServer) GenerateGenesis() error {
 		args = append(args, "--premine", acct.Addr.String()+":0x"+acct.Balance.Text(16))
 	}
 
+	// provide block time flag
+	// (e2e framework expects BlockTime parameter to be provided in seconds)
+	if t.Config.BlockTime != 0 {
+		args = append(args, "--block-time",
+			(time.Duration(t.Config.BlockTime) * time.Second).String())
+	}
+
 	// add consensus flags
 	switch t.Config.Consensus {
 	case ConsensusIBFT:
@@ -290,7 +298,7 @@ func (t *TestServer) GenerateGenesis() error {
 			return errors.New("prefix of IBFT directory is not set")
 		}
 
-		args = append(args, "--ibft-validators-prefix-path", t.Config.IBFTDirPrefix)
+		args = append(args, "--validators-prefix", t.Config.IBFTDirPrefix)
 
 		if t.Config.EpochSize != 0 {
 			args = append(args, "--epoch-size", strconv.FormatUint(t.Config.EpochSize, 10))
@@ -305,7 +313,7 @@ func (t *TestServer) GenerateGenesis() error {
 
 		// Set up any initial staker addresses for the predeployed Staking SC
 		for _, stakerAddress := range t.Config.DevStakers {
-			args = append(args, "--ibft-validator", stakerAddress.String())
+			args = append(args, "--validators", stakerAddress.String())
 		}
 	case ConsensusDummy:
 		args = append(args, "--consensus", "dummy")
@@ -338,6 +346,21 @@ func (t *TestServer) GenerateGenesis() error {
 
 	blockGasLimit := strconv.FormatUint(t.Config.BlockGasLimit, 10)
 	args = append(args, "--block-gas-limit", blockGasLimit)
+
+	// add base fee
+	if t.Config.BaseFee != 0 {
+		args = append(args, "--base-fee-config", *common.EncodeUint64(t.Config.BaseFee))
+	}
+
+	// add burn contracts
+	if len(t.Config.BurnContracts) != 0 {
+		for block, addr := range t.Config.BurnContracts {
+			args = append(args, "--burn-contract", fmt.Sprintf("%d:%s", block, addr))
+		}
+	} else {
+		// london hardfork is enabled by default so there must be a default burn contract
+		args = append(args, "--burn-contract", "0:0x0000000000000000000000000000000000000000")
+	}
 
 	cmd := exec.Command(resolveBinary(), args...) //nolint:gosec
 	cmd.Dir = t.Config.RootDir
@@ -426,11 +449,7 @@ func (t *TestServer) Start(ctx context.Context) error {
 
 	// add block gas target
 	if t.Config.BlockGasTarget != 0 {
-		args = append(args, "--block-gas-target", *types.EncodeUint64(t.Config.BlockGasTarget))
-	}
-
-	if t.Config.BlockTime != 0 {
-		args = append(args, "--block-time", strconv.FormatUint(t.Config.BlockTime, 10))
+		args = append(args, "--block-gas-target", *common.EncodeUint64(t.Config.BlockGasTarget))
 	}
 
 	if t.Config.IBFTBaseTimeout != 0 {
@@ -552,8 +571,8 @@ func (t *TestServer) DeployContract(
 }
 
 const (
-	DefaultGasPrice = 1879048192 // 0x70000000
-	DefaultGasLimit = 5242880    // 0x500000
+	DefaultGasPrice = 10e9    // 0x2540BE400
+	DefaultGasLimit = 5242880 // 0x500000
 )
 
 type PreparedTransaction struct {
@@ -586,6 +605,7 @@ func (t *Txn) Deploy(input []byte) *Txn {
 func (t *Txn) Transfer(to ethgo.Address, value *big.Int) *Txn {
 	t.raw.To = &to
 	t.raw.Value = value
+	t.raw.GasPrice = ethgo.Gwei(2).Uint64()
 
 	return t
 }
@@ -608,12 +628,6 @@ func (t *Txn) GasLimit(gas uint64) *Txn {
 	return t
 }
 
-func (t *Txn) GasPrice(price uint64) *Txn {
-	t.raw.GasPrice = price
-
-	return t
-}
-
 func (t *Txn) Nonce(nonce uint64) *Txn {
 	t.raw.Nonce = nonce
 
@@ -622,8 +636,18 @@ func (t *Txn) Nonce(nonce uint64) *Txn {
 
 func (t *Txn) sendImpl() error {
 	// populate default values
-	t.raw.Gas = 1048576
-	t.raw.GasPrice = 1048576
+	if t.raw.Gas == 0 {
+		t.raw.Gas = 1048576
+	}
+
+	if t.raw.GasPrice == 0 {
+		gasPrice, err := t.client.GasPrice()
+		if err != nil {
+			return fmt.Errorf("failed to get gas price: %w", err)
+		}
+
+		t.raw.GasPrice = gasPrice
+	}
 
 	if t.raw.Nonce == 0 {
 		nextNonce, err := t.client.GetNonce(t.key.Address(), ethgo.Latest)

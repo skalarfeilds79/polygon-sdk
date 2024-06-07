@@ -6,11 +6,11 @@ on:  # yamllint disable-line rule:truthy
       - main
       - develop  
   workflow_dispatch:
-  workflow_call:    
+  workflow_call:
     outputs:
       workflow_output:
         description: "Fuzz output"
-        value: ${{ jobs.build.outputs.fuzz_output_failure }} 
+        value: ${{ jobs.fuzz_test.outputs.fuzz_output_failure }} 
 
 
 jobs:
@@ -23,15 +23,10 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v3
         with:
-          go-version: 1.18.x
+          go-version: 1.20.x
 
       - name: Checkout Code
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
-
-      - name: Install Dependencies
-        run: ./setup-ci.sh
 
       - name: Run Fuzz Test
         run: make fuzz-test

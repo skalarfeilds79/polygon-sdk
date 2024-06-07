@@ -3,6 +3,9 @@ package genesis
 import (
 	"errors"
 	"fmt"
+	"math/big"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/0xPolygon/polygon-edge/chain"
@@ -11,6 +14,8 @@ import (
 	"github.com/0xPolygon/polygon-edge/consensus/ibft"
 	"github.com/0xPolygon/polygon-edge/consensus/ibft/fork"
 	"github.com/0xPolygon/polygon-edge/consensus/ibft/signer"
+	"github.com/0xPolygon/polygon-edge/consensus/polybft"
+	"github.com/0xPolygon/polygon-edge/contracts"
 	"github.com/0xPolygon/polygon-edge/contracts/staking"
 	stakingHelper "github.com/0xPolygon/polygon-edge/helper/staking"
 	"github.com/0xPolygon/polygon-edge/server"
@@ -19,17 +24,21 @@ import (
 )
 
 const (
-	dirFlag           = "dir"
-	nameFlag          = "name"
-	premineFlag       = "premine"
-	chainIDFlag       = "chain-id"
-	epochSizeFlag     = "epoch-size"
-	epochRewardFlag   = "epoch-reward"
-	blockGasLimitFlag = "block-gas-limit"
-	posFlag           = "pos"
-	minValidatorCount = "min-validator-count"
-	maxValidatorCount = "max-validator-count"
-	mintableTokenFlag = "mintable-native-token"
+	dirFlag                      = "dir"
+	nameFlag                     = "name"
+	premineFlag                  = "premine"
+	chainIDFlag                  = "chain-id"
+	epochSizeFlag                = "epoch-size"
+	epochRewardFlag              = "epoch-reward"
+	blockGasLimitFlag            = "block-gas-limit"
+	burnContractFlag             = "burn-contract"
+	genesisBaseFeeConfigFlag     = "base-fee-config"
+	posFlag                      = "pos"
+	nativeTokenConfigFlag        = "native-token-config"
+	rewardTokenCodeFlag          = "reward-token-code"
+	rewardWalletFlag             = "reward-wallet"
+	blockTrackerPollIntervalFlag = "block-tracker-poll-interval"
+	proxyContractsAdminFlag      = "proxy-contracts-admin"
 )
 
 // Legacy flags that need to be preserved for running clients
@@ -42,33 +51,49 @@ var (
 )
 
 var (
-	errValidatorsNotSpecified = errors.New("validator information not specified")
-	errUnsupportedConsensus   = errors.New("specified consensusRaw not supported")
-	errInvalidEpochSize       = errors.New("epoch size must be greater than 1")
+	errValidatorsNotSpecified   = errors.New("validator information not specified")
+	errUnsupportedConsensus     = errors.New("specified consensusRaw not supported")
+	errInvalidEpochSize         = errors.New("epoch size must be greater than 1")
+	errRewardWalletAmountZero   = errors.New("reward wallet amount can not be zero or negative")
+	errReserveAccMustBePremined = errors.New("it is mandatory to premine reserve account (0x0 address)")
+	errBlockTrackerPollInterval = errors.New("block tracker poll interval must be greater than 0")
+	errBaseFeeChangeDenomZero   = errors.New("base fee change denominator must be greater than 0")
+	errBaseFeeEMZero            = errors.New("base fee elasticity multiplier must be greater than 0")
+	errBaseFeeZero              = errors.New("base fee  must be greater than 0")
+	errRewardWalletNotDefined   = errors.New("reward wallet address must be defined")
+	errRewardTokenOnNonMintable = errors.New("a custom reward token must be defined when " +
+		"native ERC20 token is non-mintable")
+	errRewardWalletZero = errors.New("reward wallet address must not be zero address")
 )
 
 type genesisParams struct {
-	genesisPath         string
-	name                string
-	consensusRaw        string
-	validatorPrefixPath string
-	premine             []string
-	bootnodes           []string
-	ibftValidators      validators.Validators
-
-	ibftValidatorsRaw []string
+	genesisPath  string
+	name         string
+	consensusRaw string
+	premine      []string
+	bootnodes    []string
 
 	chainID   uint64
 	epochSize uint64
 
 	blockGasLimit uint64
-	isPos         bool
 
-	minNumValidators uint64
-	maxNumValidators uint64
+	burnContract        string
+	baseFeeConfig       string
+	parsedBaseFeeConfig *baseFeeInfo
 
+	// PoS
+	isPos                bool
+	minNumValidators     uint64
+	maxNumValidators     uint64
+	validatorsPath       string
+	validatorsPrefixPath string
+	validators           []string
+
+	// IBFT
 	rawIBFTValidatorType string
 	ibftValidatorType    validators.ValidatorType
+	ibftValidators       validators.Validators
 
 	extraData []byte
 	consensus server.ConsensusType
@@ -78,23 +103,39 @@ type genesisParams struct {
 	genesisConfig *chain.Chain
 
 	// PolyBFT
-	manifestPath            string
-	validatorSetSize        int
-	sprintSize              uint64
-	blockTime               time.Duration
-	bridgeJSONRPCAddr       string
-	epochReward             uint64
-	eventTrackerStartBlocks []string
+	sprintSize     uint64
+	blockTime      time.Duration
+	epochReward    uint64
+	blockTimeDrift uint64
 
 	initialStateRoot string
 
-	// allowlist
+	// access lists
 	contractDeployerAllowListAdmin   []string
 	contractDeployerAllowListEnabled []string
+	contractDeployerBlockListAdmin   []string
+	contractDeployerBlockListEnabled []string
 	transactionsAllowListAdmin       []string
 	transactionsAllowListEnabled     []string
+	transactionsBlockListAdmin       []string
+	transactionsBlockListEnabled     []string
+	bridgeAllowListAdmin             []string
+	bridgeAllowListEnabled           []string
+	bridgeBlockListAdmin             []string
+	bridgeBlockListEnabled           []string
 
-	mintableNativeToken bool
+	nativeTokenConfigRaw string
+	nativeTokenConfig    *polybft.TokenConfig
+
+	premineInfos []*helper.PremineInfo
+
+	// rewards
+	rewardTokenCode string
+	rewardWallet    string
+
+	blockTrackerPollInterval time.Duration
+
+	proxyContractsAdmin string
 }
 
 func (p *genesisParams) validateFlags() error {
@@ -103,11 +144,41 @@ func (p *genesisParams) validateFlags() error {
 		return errUnsupportedConsensus
 	}
 
+	if err := p.validateGenesisBaseFeeConfig(); err != nil {
+		return err
+	}
+
 	// Check if validator information is set at all
 	if p.isIBFTConsensus() &&
 		!p.areValidatorsSetManually() &&
 		!p.areValidatorsSetByPrefix() {
 		return errValidatorsNotSpecified
+	}
+
+	if err := p.parsePremineInfo(); err != nil {
+		return err
+	}
+
+	if p.isPolyBFTConsensus() {
+		if err := p.extractNativeTokenMetadata(); err != nil {
+			return err
+		}
+
+		if err := p.validateBurnContract(); err != nil {
+			return err
+		}
+
+		if err := p.validateRewardWalletAndToken(); err != nil {
+			return err
+		}
+
+		if err := p.validatePremineInfo(); err != nil {
+			return err
+		}
+
+		if err := p.validateProxyContractsAdmin(); err != nil {
+			return err
+		}
 	}
 
 	// Check if the genesis file already exists
@@ -123,12 +194,15 @@ func (p *genesisParams) validateFlags() error {
 		return errInvalidEpochSize
 	}
 
-	// Validate min and max validators number
-	if err := command.ValidateMinMaxValidatorsNumber(p.minNumValidators, p.maxNumValidators); err != nil {
-		return err
+	// Validate validatorsPath only if validators information were not provided via CLI flag
+	if len(p.validators) == 0 {
+		if _, err := os.Stat(p.validatorsPath); err != nil {
+			return fmt.Errorf("invalid validators path ('%s') provided. Error: %w", p.validatorsPath, err)
+		}
 	}
 
-	return nil
+	// Validate min and max validators number
+	return command.ValidateMinMaxValidatorsNumber(p.minNumValidators, p.maxNumValidators)
 }
 
 func (p *genesisParams) isIBFTConsensus() bool {
@@ -140,11 +214,11 @@ func (p *genesisParams) isPolyBFTConsensus() bool {
 }
 
 func (p *genesisParams) areValidatorsSetManually() bool {
-	return len(p.ibftValidatorsRaw) != 0
+	return len(p.validators) != 0
 }
 
 func (p *genesisParams) areValidatorsSetByPrefix() bool {
-	return p.validatorPrefixPath != ""
+	return p.validatorsPrefixPath != ""
 }
 
 func (p *genesisParams) getRequiredFlags() []string {
@@ -180,11 +254,11 @@ func (p *genesisParams) initRawParams() error {
 
 // setValidatorSetFromCli sets validator set from cli command
 func (p *genesisParams) setValidatorSetFromCli() error {
-	if len(p.ibftValidatorsRaw) == 0 {
+	if len(p.validators) == 0 {
 		return nil
 	}
 
-	newValidators, err := validators.ParseValidators(p.ibftValidatorType, p.ibftValidatorsRaw)
+	newValidators, err := validators.ParseValidators(p.ibftValidatorType, p.validators)
 	if err != nil {
 		return err
 	}
@@ -203,7 +277,8 @@ func (p *genesisParams) setValidatorSetFromPrefixPath() error {
 	}
 
 	validators, err := command.GetValidatorsFromPrefixPath(
-		p.validatorPrefixPath,
+		p.validatorsPath,
+		p.validatorsPrefixPath,
 		p.ibftValidatorType,
 	)
 
@@ -299,6 +374,7 @@ func (p *genesisParams) initIBFTEngineMap(ibftType fork.IBFTType) {
 		string(server.IBFTConsensus): map[string]interface{}{
 			fork.KeyType:          ibftType,
 			fork.KeyValidatorType: p.ibftValidatorType,
+			fork.KeyBlockTime:     p.blockTime,
 			ibft.KeyEpochSize:     p.epochSize,
 		},
 	}
@@ -320,6 +396,12 @@ func (p *genesisParams) generateGenesis() error {
 }
 
 func (p *genesisParams) initGenesisConfig() error {
+	// Disable london hardfork if burn contract address is not provided
+	enabledForks := chain.AllForksEnabled
+	if !p.isBurnContractEnabled() {
+		enabledForks.RemoveFork(chain.London)
+	}
+
 	chainConfig := &chain.Chain{
 		Name: p.name,
 		Genesis: &chain.Genesis{
@@ -331,10 +413,26 @@ func (p *genesisParams) initGenesisConfig() error {
 		},
 		Params: &chain.Params{
 			ChainID: int64(p.chainID),
-			Forks:   chain.AllForksEnabled,
+			Forks:   enabledForks,
 			Engine:  p.consensusEngineConfig,
 		},
 		Bootnodes: p.bootnodes,
+	}
+
+	// burn contract can be set only for non mintable native token
+	if p.isBurnContractEnabled() {
+		chainConfig.Genesis.BaseFee = p.parsedBaseFeeConfig.baseFee
+		chainConfig.Genesis.BaseFeeEM = p.parsedBaseFeeConfig.baseFeeEM
+		chainConfig.Genesis.BaseFeeChangeDenom = p.parsedBaseFeeConfig.baseFeeChangeDenom
+		chainConfig.Params.BurnContract = make(map[uint64]types.Address, 1)
+
+		burnContractInfo, err := parseBurnContractInfo(p.burnContract)
+		if err != nil {
+			return err
+		}
+
+		chainConfig.Params.BurnContract[burnContractInfo.BlockNumber] = burnContractInfo.Address
+		chainConfig.Params.BurnContractDestinationAddress = burnContractInfo.DestinationAddress
 	}
 
 	// Predeploy staking smart contract if needed
@@ -347,12 +445,7 @@ func (p *genesisParams) initGenesisConfig() error {
 		chainConfig.Genesis.Alloc[staking.AddrStakingContract] = stakingAccount
 	}
 
-	for _, premineRaw := range p.premine {
-		premineInfo, err := ParsePremineInfo(premineRaw)
-		if err != nil {
-			return err
-		}
-
+	for _, premineInfo := range p.premineInfos {
 		chainConfig.Genesis.Alloc[premineInfo.Address] = &chain.GenesisAccount{
 			Balance: premineInfo.Amount,
 		}
@@ -381,6 +474,156 @@ func (p *genesisParams) predeployStakingSC() (*chain.GenesisAccount, error) {
 	}
 
 	return stakingAccount, nil
+}
+
+// validateRewardWalletAndToken validates reward wallet flag
+func (p *genesisParams) validateRewardWalletAndToken() error {
+	if p.rewardWallet == "" {
+		return errRewardWalletNotDefined
+	}
+
+	if !p.nativeTokenConfig.IsMintable && p.rewardTokenCode == "" {
+		return errRewardTokenOnNonMintable
+	}
+
+	premineInfo, err := helper.ParsePremineInfo(p.rewardWallet)
+	if err != nil {
+		return err
+	}
+
+	if premineInfo.Address == types.ZeroAddress {
+		return errRewardWalletZero
+	}
+
+	// If epoch rewards are enabled, reward wallet must have some amount of premine
+	if p.epochReward > 0 && premineInfo.Amount.Cmp(big.NewInt(0)) < 1 {
+		return errRewardWalletAmountZero
+	}
+
+	return nil
+}
+
+// parsePremineInfo parses premine flag
+func (p *genesisParams) parsePremineInfo() error {
+	p.premineInfos = make([]*helper.PremineInfo, 0, len(p.premine))
+
+	for _, premine := range p.premine {
+		premineInfo, err := helper.ParsePremineInfo(premine)
+		if err != nil {
+			return fmt.Errorf("invalid premine balance amount provided: %w", err)
+		}
+
+		p.premineInfos = append(p.premineInfos, premineInfo)
+	}
+
+	return nil
+}
+
+// validatePremineInfo validates whether reserve account (0x0 address) is premined
+func (p *genesisParams) validatePremineInfo() error {
+	for _, premineInfo := range p.premineInfos {
+		if premineInfo.Address == types.ZeroAddress {
+			// we have premine of zero address, just return
+			return nil
+		}
+	}
+
+	return errReserveAccMustBePremined
+}
+
+// validateBlockTrackerPollInterval validates block tracker block interval
+// which can not be 0
+func (p *genesisParams) validateBlockTrackerPollInterval() error {
+	if p.blockTrackerPollInterval == 0 {
+		return helper.ErrBlockTrackerPollInterval
+	}
+
+	return nil
+}
+
+// validateBurnContract validates burn contract. If native token is mintable,
+// burn contract flag must not be set. If native token is non mintable only one burn contract
+// can be set and the specified address will be used to predeploy default EIP1559 burn contract.
+func (p *genesisParams) validateBurnContract() error {
+	if p.isBurnContractEnabled() {
+		burnContractInfo, err := parseBurnContractInfo(p.burnContract)
+		if err != nil {
+			return fmt.Errorf("invalid burn contract info provided: %w", err)
+		}
+
+		if p.nativeTokenConfig.IsMintable {
+			if burnContractInfo.Address != types.ZeroAddress {
+				return errors.New("only zero address is allowed as burn destination for mintable native token")
+			}
+		} else {
+			if burnContractInfo.Address == types.ZeroAddress {
+				return errors.New("it is not allowed to deploy burn contract to 0x0 address")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (p *genesisParams) validateGenesisBaseFeeConfig() error {
+	if p.baseFeeConfig == "" {
+		return errors.New("invalid input(empty string) for genesis base fee config flag")
+	}
+
+	baseFeeInfo, err := parseBaseFeeConfig(p.baseFeeConfig)
+	if err != nil {
+		return fmt.Errorf("failed to parse base fee config: %w, provided value %s", err, p.baseFeeConfig)
+	}
+
+	p.parsedBaseFeeConfig = baseFeeInfo
+
+	if baseFeeInfo.baseFee == 0 {
+		return errBaseFeeZero
+	}
+
+	if baseFeeInfo.baseFeeEM == 0 {
+		return errBaseFeeEMZero
+	}
+
+	if baseFeeInfo.baseFeeChangeDenom == 0 {
+		return errBaseFeeChangeDenomZero
+	}
+
+	return nil
+}
+
+func (p *genesisParams) validateProxyContractsAdmin() error {
+	if strings.TrimSpace(p.proxyContractsAdmin) == "" {
+		return errors.New("proxy contracts admin address must be set")
+	}
+
+	proxyContractsAdminAddr := types.StringToAddress(p.proxyContractsAdmin)
+	if proxyContractsAdminAddr == types.ZeroAddress {
+		return errors.New("proxy contracts admin address must not be zero address")
+	}
+
+	if proxyContractsAdminAddr == contracts.SystemCaller {
+		return errors.New("proxy contracts admin address must not be system caller address")
+	}
+
+	return nil
+}
+
+// isBurnContractEnabled returns true in case burn contract info is provided
+func (p *genesisParams) isBurnContractEnabled() bool {
+	return p.burnContract != ""
+}
+
+// extractNativeTokenMetadata parses provided native token metadata (such as name, symbol and decimals count)
+func (p *genesisParams) extractNativeTokenMetadata() error {
+	tokenConfig, err := polybft.ParseRawTokenConfig(p.nativeTokenConfigRaw)
+	if err != nil {
+		return err
+	}
+
+	p.nativeTokenConfig = tokenConfig
+
+	return nil
 }
 
 func (p *genesisParams) getResult() command.CommandResult {
