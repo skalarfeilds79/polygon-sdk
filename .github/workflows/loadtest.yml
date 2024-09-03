@@ -95,7 +95,7 @@ jobs:
         env: 
           url: ${{ secrets.LOADTEST_RPC_URL }}
         if: ${{ env.url == '' }}
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: rpc_url
 
